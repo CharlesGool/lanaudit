@@ -12,7 +12,9 @@ can tell whether any device on your own network is still using one of them.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import sys
+import threading
 import time
 
 # Banners/titles pulled off random devices can contain bytes that don't map
@@ -49,6 +51,38 @@ def _findings_table(findings):
     lines = [fmt_row([h for h, _ in cols]), fmt_row(["-" * w for w in widths])]
     lines += [fmt_row(r) for r in rows]
     return "\n".join(lines)
+
+
+def _detect_lockout(timeline):
+    """timeline: [(submission_seq, True/False/None), ...] for every attempt
+    that actually ran against one host/port (skipped-because-already-done
+    entries are excluded by the caller). If the device started out giving
+    real rejections (False) and then, later in submission order, the tail
+    turns into an unbroken run of None (checker couldn't even complete the
+    protocol handshake — connection refused/reset/timed out), that's the
+    signature of a self-protecting lockout/ban kicking in partway through,
+    not just noise: a device with no such protection keeps answering False
+    the whole way through.
+    """
+    if len(timeline) < 10:
+        return None
+    timeline = sorted(timeline, key=lambda t: t[0])
+    results = [r for _, r in timeline]
+    last_real = max((i for i, r in enumerate(results) if r is False), default=-1)
+    if last_real < 0:
+        return None  # never got a real rejection at all -- nothing to compare against
+    tail = results[last_real + 1:]
+    if len(tail) < 5:
+        return None
+    none_run = 0
+    for r in reversed(tail):
+        if r is None:
+            none_run += 1
+        else:
+            break
+    if none_run >= 5 and none_run / len(tail) > 0.8:
+        return {"rejected": last_real + 1, "stalled": none_run}
+    return None
 
 
 def _preflight_check(args):
@@ -123,42 +157,67 @@ def cmd_audit(args):
     hosts = cmd_scan(args)
 
     cap = args.max_fail if args.max_fail > 0 else None
-    cap_desc = f"每台设备连续失败 {cap} 次后跳过" if cap else "每台设备会把密码表试完,不会提前放弃"
+    cap_desc = f"每台设备累计失败 {cap} 次后跳过" if cap else "每台设备会把密码表试完,不会提前放弃"
     print(f"\n[*] 用户名 {len(usernames)} 个 x 密码 {len(passwords)} 个,"
-          f"对发现的服务逐个尝试({cap_desc})...", file=sys.stderr)
+          f"每台设备 {args.audit_workers} 个线程并发尝试({cap_desc})...", file=sys.stderr)
 
     findings = []
+    lockout_suspects = []
     for h in hosts:
         for p in h.ports:
             checker = REGISTRY.get(p.guessed_service)
             if checker is None:
                 continue
-            fail_count = 0
-            hit = False
-            for username in usernames:
-                if hit or (cap and fail_count >= cap):
-                    break
-                for password in passwords:
-                    if cap and fail_count >= cap:
-                        break
-                    result = checker(h.ip, p.port, username, password, args.timeout)
+            found = threading.Event()
+            cap_hit = threading.Event()
+            fail_count = [0]
+            lock = threading.Lock()
+            timeline = []  # (seq, result) in submission order, filled in as completed
+
+            combos = [(u, pw) for u in usernames for pw in passwords]
+
+            def attempt(seq, username, password):
+                if found.is_set() or cap_hit.is_set():
+                    return seq, username, password, None, True  # skipped, not a real outcome
+                result = checker(h.ip, p.port, username, password, args.timeout)
+                if args.delay:
                     time.sleep(args.delay)
+                with lock:
+                    if result is True:
+                        found.set()
+                    elif result is False:
+                        fail_count[0] += 1
+                        if cap and fail_count[0] >= cap:
+                            cap_hit.set()
+                return seq, username, password, result, False
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=args.audit_workers) as ex:
+                futs = [ex.submit(attempt, i, u, pw) for i, (u, pw) in enumerate(combos)]
+                for fut in concurrent.futures.as_completed(futs):
+                    seq, username, password, result, skipped = fut.result()
+                    if not skipped:
+                        timeline.append((seq, result))
                     if result is True:
                         findings.append({"ip": h.ip, "port": p.port,
                                           "service": p.guessed_service,
                                           "username": username, "password": password})
                         print(f"\n[!] {h.ip}:{p.port} ({p.guessed_service}) "
                               f"{username}/{password or '(空)'} 登录成功", file=sys.stderr)
-                        hit = True
-                        break
-                    if result is False:
-                        fail_count += 1
-                if hit:
-                    break
+
+            suspect = _detect_lockout(timeline)
+            if suspect:
+                suspect.update(ip=h.ip, port=p.port, service=p.guessed_service)
+                lockout_suspects.append(suspect)
 
     print(f"\n[*] 完成,共 {len(findings)} 处弱密码/无密码可登录。", file=sys.stderr)
     if findings:
         print("\n" + _findings_table(findings))
+    if lockout_suspects:
+        print(f"\n[*] {len(lockout_suspects)} 处疑似触发了设备自己的失败锁定/封禁"
+              f"(前面还在正常拒绝,后面一段全部连不上/没反应):", file=sys.stderr)
+        for s in lockout_suspects:
+            print(f"  - {s['ip']}:{s['port']} ({s['service']}): 正常拒绝 {s['rejected']} 次后,"
+                  f"后面 {s['stalled']} 次全部无响应", file=sys.stderr)
     if args.json:
         data = report.discovery_to_dict(hosts)
         report.write_json(args.json, {"hosts": data, "findings": findings})
@@ -208,10 +267,17 @@ def build_parser():
     a.add_argument("--username-file", help="每行一个用户名的文件")
     a.add_argument("--password-file", help="每行一个密码的文件")
     a.add_argument("--max-fail", type=int, default=0,
-                    help="同一台设备连续失败多少次后跳过。默认 0 = 不设上限,"
+                    help="同一台设备累计失败多少次后跳过。默认 0 = 不设上限,"
                          "密码表会试完;担心把有登录锁定机制的设备越试越锁,"
-                         "可以设一个数,比如 6")
-    a.add_argument("--delay", type=float, default=0.3, help="每次尝试之间的延迟(秒)")
+                         "可以设一个数,比如 6(并发下这个数不再是\"连续\"失败,"
+                         "是总的失败次数)")
+    a.add_argument("--audit-workers", type=int, default=16,
+                    help="对同一台设备同一个服务,同时并发尝试几个用户名/密码组合"
+                         "(默认 16)。调大能明显提速,也正好用来看这台设备有没有"
+                         "\"同 IP 短时间内多次失败就封禁/限速\"的防护——如果开大了之后"
+                         "后面全部连不上,报告里会提示疑似触发了锁定")
+    a.add_argument("--delay", type=float, default=0.3,
+                    help="每个线程每次尝试之间的延迟(秒),默认 0.3;改成 0 就是不限速")
     a.set_defaults(func=cmd_audit)
 
     return p
