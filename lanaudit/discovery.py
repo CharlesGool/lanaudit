@@ -11,6 +11,8 @@ import socket
 import ssl
 from dataclasses import dataclass, field
 
+from . import names
+
 COMMON_PORTS = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns",
     80: "http", 81: "http", 88: "http", 139: "smb", 443: "https",
@@ -48,6 +50,7 @@ class PortInfo:
 class HostResult:
     ip: str
     ports: list = field(default_factory=list)
+    name: str = ""
 
 
 def _tcp_connect(ip, port, timeout):
@@ -236,7 +239,7 @@ def transparent_proxy_warning(sample_ip: str, timeout=1.0) -> bool:
 
 
 def scan_subnet(subnet: str, ports=None, connect_timeout=0.35, read_timeout=1.2,
-                 max_workers=200, progress_cb=None):
+                 max_workers=200, progress_cb=None, lookup_names=True):
     """Scan every host address in `subnet` (CIDR) for `ports`. Returns a list
     of HostResult for hosts that had at least one open port.
 
@@ -268,4 +271,24 @@ def scan_subnet(subnet: str, ports=None, connect_timeout=0.35, read_timeout=1.2,
     out = [HostResult(ip=ip, ports=sorted(infos, key=lambda i: i.port))
            for ip, infos in results.items()]
     out.sort(key=lambda h: tuple(int(x) for x in h.ip.split(".")))
+
+    if out and lookup_names:
+        _attach_names(out, timeout=read_timeout, max_workers=max_workers)
     return out
+
+
+def _attach_names(hosts, timeout, max_workers):
+    """One reverse-DNS + one NetBIOS query per discovered host, in parallel.
+    Best-effort — a name that can't be found just stays empty."""
+    def resolve(h):
+        name = names.reverse_dns(h.ip, timeout=min(timeout, 0.8))
+        if not name:
+            name = names.netbios_name(h.ip, timeout=min(timeout, 0.8))
+        return h.ip, name
+
+    by_ip = {h.ip: h for h in hosts}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(max_workers, len(hosts) or 1)) as ex:
+        futs = {ex.submit(resolve, h): h for h in hosts}
+        for fut in concurrent.futures.as_completed(futs):
+            ip, name = fut.result()
+            by_ip[ip].name = name

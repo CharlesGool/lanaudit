@@ -68,11 +68,11 @@ def cmd_scan(args):
     t0 = time.time()
     hosts = discovery.scan_subnet(args.subnet, connect_timeout=args.connect_timeout,
                                    read_timeout=args.timeout, max_workers=args.workers,
-                                   progress_cb=_print_progress)
+                                   progress_cb=_print_progress, lookup_names=not args.no_names)
     print(f"\n[*] 完成,用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
           file=sys.stderr)
     for h in hosts:
-        print(f"\n{h.ip}")
+        print(f"\n{h.ip}" + (f"  ({h.name})" if h.name else ""))
         for p in h.ports:
             label = p.http_title or p.http_server or p.banner
             tag = "" if p.confirmed else "  [未确认,可能是代理误判]"
@@ -177,6 +177,8 @@ def build_parser():
     common.add_argument("--markdown", help="把结果写成 Markdown 报告文件")
     common.add_argument("--force", action="store_true",
                          help="跳过透明代理/VPN 的预检查警告,直接开始扫描")
+    common.add_argument("--no-names", action="store_true",
+                         help="不尝试反查设备名(反向 DNS / NetBIOS),扫描会快一点")
 
     s = sub.add_parser("scan", parents=[common], help="只做端口/服务发现,不尝试任何密码")
     s.set_defaults(func=cmd_scan)

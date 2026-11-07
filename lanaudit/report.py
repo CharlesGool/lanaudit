@@ -4,7 +4,7 @@ from dataclasses import asdict
 
 
 def discovery_to_dict(hosts):
-    return [{"ip": h.ip, "ports": [asdict(p) for p in h.ports]} for h in hosts]
+    return [{"ip": h.ip, "name": h.name, "ports": [asdict(p) for p in h.ports]} for h in hosts]
 
 
 def write_json(path, data):
@@ -32,7 +32,7 @@ def render_markdown(subnet, hosts, findings):
     if not hosts:
         lines.append("(没有发现开放端口的主机)")
     for h in hosts:
-        lines.append(f"### {h.ip}")
+        lines.append(f"### {h.ip}" + (f"  —  {h.name}" if h.name else ""))
         for p in h.ports:
             label = p.http_title or p.http_server or p.banner or ""
             tag = "" if p.confirmed else " **[未确认,可能是本机代理/VPN 造成的误判]**"
