@@ -31,13 +31,17 @@ def render_markdown(subnet, hosts, findings):
     lines.append("")
     if not hosts:
         lines.append("(没有发现开放端口的主机)")
-    for h in hosts:
-        lines.append(f"### {h.ip}" + (f"  —  {h.name}" if h.name else ""))
-        for p in h.ports:
-            label = p.http_title or p.http_server or p.banner or ""
-            tag = "" if p.confirmed else " **[未确认,可能是本机代理/VPN 造成的误判]**"
-            lines.append(f"- 端口 {p.port} ({p.guessed_service}) {('— ' + label) if label else ''}{tag}")
-        lines.append("")
+    else:
+        lines.append("| IP | 设备名 | 端口 | 服务 | 信息 |")
+        lines.append("|---|---|---|---|---|")
+        for h in hosts:
+            for i, p in enumerate(h.ports):
+                label = p.http_title or p.http_server or p.banner or ""
+                if not p.confirmed:
+                    label = (label + " " if label else "") + "**[未确认,可能是本机代理/VPN 造成的误判]**"
+                lines.append(f"| {h.ip if i == 0 else ''} | {h.name if i == 0 else ''} | "
+                             f"{p.port} | {p.guessed_service} | {label} |")
+    lines.append("")
 
     lines.append("## 弱密码 / 风险发现")
     lines.append("")

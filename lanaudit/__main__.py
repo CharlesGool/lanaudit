@@ -41,16 +41,34 @@ def _print_progress(done, total):
     print(f"\r扫描中... {done}/{total}", end="", file=sys.stderr, flush=True)
 
 
+def _table(headers, rows):
+    widths = [max(len(h), *(len(r[i]) for r in rows)) if rows else len(h)
+              for i, h in enumerate(headers)]
+    def fmt_row(cells):
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths))
+    lines = [fmt_row(headers), fmt_row(["-" * w for w in widths])]
+    lines += [fmt_row(r) for r in rows]
+    return "\n".join(lines)
+
+
 def _findings_table(findings):
     cols = [("IP", "ip"), ("端口", "port"), ("服务", "service"),
             ("用户名", "username"), ("密码", "password")]
     rows = [[str(f[key]) if f[key] != "" else "(空)" for _, key in cols] for f in findings]
-    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, (h, _) in enumerate(cols)]
-    def fmt_row(cells):
-        return "  ".join(c.ljust(w) for c, w in zip(cells, widths))
-    lines = [fmt_row([h for h, _ in cols]), fmt_row(["-" * w for w in widths])]
-    lines += [fmt_row(r) for r in rows]
-    return "\n".join(lines)
+    return _table([h for h, _ in cols], rows)
+
+
+def _scan_table(hosts):
+    headers = ["IP", "设备名", "端口", "服务", "信息"]
+    rows = []
+    for h in hosts:
+        for i, p in enumerate(h.ports):
+            label = p.http_title or p.http_server or p.banner
+            if not p.confirmed:
+                label = (label + " " if label else "") + "[未确认,可能是代理误判]"
+            rows.append([h.ip if i == 0 else "", h.name if i == 0 else "",
+                         str(p.port), p.guessed_service, label[:80]])
+    return _table(headers, rows)
 
 
 def _detect_lockout(timeline):
@@ -117,12 +135,8 @@ def cmd_scan(args):
                                    progress_cb=_print_progress, lookup_names=not args.no_names)
     print(f"\n[*] 完成,用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
           file=sys.stderr)
-    for h in hosts:
-        print(f"\n{h.ip}" + (f"  ({h.name})" if h.name else ""))
-        for p in h.ports:
-            label = p.http_title or p.http_server or p.banner
-            tag = "" if p.confirmed else "  [未确认,可能是代理误判]"
-            print(f"  {p.port:>6}  {p.guessed_service:<8} {label[:80]}{tag}")
+    if hosts:
+        print("\n" + _scan_table(hosts))
     if args.json:
         report.write_json(args.json, report.discovery_to_dict(hosts))
         print(f"\n[*] JSON 已保存到 {args.json}", file=sys.stderr)
