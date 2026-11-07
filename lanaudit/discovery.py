@@ -177,6 +177,25 @@ def _parse_http(raw: bytes):
     return title, server, auth
 
 
+def _clean_banner(raw: bytes) -> str:
+    """Most text-banner protocols (SSH, FTP, Telnet, SMTP...) send one
+    greeting line and then immediately start a binary handshake (SSH's
+    KEX_INIT, in particular) that our 256-byte banner read also happens to
+    catch the start of. Keep only the first line, and only if it looks like
+    actual text — otherwise there's nothing readable to show.
+    """
+    first_line = raw.split(b"\n", 1)[0].split(b"\r", 1)[0]
+    if not first_line:
+        return ""
+    text = first_line.decode("utf-8", errors="replace").strip()
+    # A banner that's mostly replacement/control characters isn't text at
+    # all (binary protocol with no greeting line) -- don't show it.
+    printable = sum(1 for c in text if c.isprintable())
+    if not text or printable / max(len(text), 1) < 0.9:
+        return ""
+    return text[:200]
+
+
 def _scan_port(ip, port, connect_timeout, read_timeout):
     # Most of a /24 is dead IPs and closed/filtered ports — paying the full
     # (generously long, for proxied/relayed real services) read timeout on
@@ -193,7 +212,12 @@ def _scan_port(ip, port, connect_timeout, read_timeout):
         pass
 
     info = PortInfo(port=port, guessed_service=COMMON_PORTS.get(port, "unknown"),
-                     banner=banner.decode("utf-8", errors="replace").strip()[:200])
+                     banner=_clean_banner(banner))
+    # A real but binary/line-less banner (MySQL's greeting packet, say)
+    # still proves the port answered with protocol data even if there was
+    # no readable text to show for it -- track that separately from what
+    # ends up in the (cosmetic) `banner` field.
+    got_evidence = bool(banner)
 
     if port in HTTP_PORTS or port in HTTPS_PORTS:
         raw = _http_probe(ip, port, use_tls=port in HTTPS_PORTS, timeout=read_timeout)
@@ -205,11 +229,15 @@ def _scan_port(ip, port, connect_timeout, read_timeout):
         # Services that stay silent until spoken to: a bare connect() success
         # tells us nothing (and is exactly what a transparent proxy fakes), so
         # send the real handshake and only trust a protocol-shaped reply.
+        # These protocols (RDP, Redis, RTSP) don't hand back human-readable
+        # text even when they're genuinely confirmed, so show a fixed label
+        # instead of dumping raw/partly-binary bytes to the console.
         resp = ACTIVE_PROBES[info.guessed_service](ip, port, read_timeout)
         if resp:
-            info.banner = resp.decode("utf-8", errors="replace").strip()[:200]
+            info.banner = f"{info.guessed_service.upper()} 握手确认"
+            got_evidence = True
 
-    info.confirmed = bool(info.banner or info.http_title or info.http_server or info.http_auth)
+    info.confirmed = bool(got_evidence or info.http_title or info.http_server or info.http_auth)
     return info
 
 
