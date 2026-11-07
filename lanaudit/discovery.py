@@ -174,11 +174,16 @@ def _parse_http(raw: bytes):
     return title, server, auth
 
 
-def _scan_port(ip, port, timeout):
-    s = _tcp_connect(ip, port, timeout)
+def _scan_port(ip, port, connect_timeout, read_timeout):
+    # Most of a /24 is dead IPs and closed/filtered ports — paying the full
+    # (generously long, for proxied/relayed real services) read timeout on
+    # every single one of those makes a full scan crawl. So: fail fast on
+    # connect(), only spend the longer timeout once something is actually
+    # listening and we're trying to read real protocol data out of it.
+    s = _tcp_connect(ip, port, connect_timeout)
     if s is None:
         return None
-    banner = _grab_banner(s, max(timeout, 1.0))
+    banner = _grab_banner(s, read_timeout)
     try:
         s.close()
     except OSError:
@@ -188,7 +193,7 @@ def _scan_port(ip, port, timeout):
                      banner=banner.decode("utf-8", errors="replace").strip()[:200])
 
     if port in HTTP_PORTS or port in HTTPS_PORTS:
-        raw = _http_probe(ip, port, use_tls=port in HTTPS_PORTS, timeout=timeout)
+        raw = _http_probe(ip, port, use_tls=port in HTTPS_PORTS, timeout=read_timeout)
         if raw:
             title, server, auth = _parse_http(raw)
             info.http_title, info.http_server, info.http_auth = title, server, auth
@@ -197,7 +202,7 @@ def _scan_port(ip, port, timeout):
         # Services that stay silent until spoken to: a bare connect() success
         # tells us nothing (and is exactly what a transparent proxy fakes), so
         # send the real handshake and only trust a protocol-shaped reply.
-        resp = ACTIVE_PROBES[info.guessed_service](ip, port, timeout)
+        resp = ACTIVE_PROBES[info.guessed_service](ip, port, read_timeout)
         if resp:
             info.banner = resp.decode("utf-8", errors="replace").strip()[:200]
 
@@ -230,9 +235,16 @@ def transparent_proxy_warning(sample_ip: str, timeout=1.0) -> bool:
     return hits == len(probe_ports)
 
 
-def scan_subnet(subnet: str, ports=None, timeout=0.6, max_workers=80, progress_cb=None):
+def scan_subnet(subnet: str, ports=None, connect_timeout=0.35, read_timeout=1.2,
+                 max_workers=200, progress_cb=None):
     """Scan every host address in `subnet` (CIDR) for `ports`. Returns a list
     of HostResult for hosts that had at least one open port.
+
+    `connect_timeout` bounds the initial connect() attempt (kept short since
+    most of a /24 is dead IPs/closed ports); `read_timeout` only applies once
+    a connection actually succeeds, while we try to read a real banner or do
+    an active protocol probe — give that one more room, especially if the
+    path to the target goes through a relay/tunnel.
     """
     net = ipaddress.ip_network(subnet, strict=False)
     ports = ports or list(COMMON_PORTS)
@@ -242,7 +254,8 @@ def scan_subnet(subnet: str, ports=None, timeout=0.6, max_workers=80, progress_c
     tasks = [(ip, p) for ip in hosts for p in ports]
     done = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_scan_port, ip, p, timeout): (ip, p) for ip, p in tasks}
+        futs = {ex.submit(_scan_port, ip, p, connect_timeout, read_timeout): (ip, p)
+                for ip, p in tasks}
         for fut in concurrent.futures.as_completed(futs):
             ip, _port = futs[fut]
             done += 1

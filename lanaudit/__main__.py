@@ -66,8 +66,9 @@ def cmd_scan(args):
     _preflight_check(args)
     print(f"[*] 正在扫描 {args.subnet} ...", file=sys.stderr)
     t0 = time.time()
-    hosts = discovery.scan_subnet(args.subnet, timeout=args.timeout,
-                                   max_workers=args.workers, progress_cb=_print_progress)
+    hosts = discovery.scan_subnet(args.subnet, connect_timeout=args.connect_timeout,
+                                   read_timeout=args.timeout, max_workers=args.workers,
+                                   progress_cb=_print_progress)
     print(f"\n[*] 完成,用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
           file=sys.stderr)
     for h in hosts:
@@ -162,9 +163,16 @@ def build_parser():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--subnet", required=True, help="CIDR,例如 192.168.1.0/24")
     common.add_argument("--timeout", type=float, default=1.2,
-                         help="每次连接/读取超时(秒)。局域网里如果有透明代理/TUN VPN,"
-                              "真实服务的数据可能要多转一道手,适当调大能减少漏判")
-    common.add_argument("--workers", type=int, default=60, help="扫描并发数")
+                         help="连上之后读取 banner/协议回应的超时(秒)。局域网里如果有"
+                              "透明代理/TUN VPN 或要跨隧道访问,真实服务的数据可能要多转"
+                              "一道手,适当调大能减少漏判(不影响扫描速度,只有真连上的"
+                              "端口才会等这么久)")
+    common.add_argument("--connect-timeout", type=float, default=0.35,
+                         help="TCP connect() 本身的超时(秒),决定扫描速度的主要是这个,"
+                              "网络好的话可以调小,比如 0.15")
+    common.add_argument("--workers", type=int, default=200,
+                         help="扫描并发线程数,纯 I/O 等待,调大基本不费 CPU,"
+                              "网络/对端能扛得住的话可以调到 500+ 提速")
     common.add_argument("--json", help="把结果写成 JSON 文件")
     common.add_argument("--markdown", help="把结果写成 Markdown 报告文件")
     common.add_argument("--force", action="store_true",
