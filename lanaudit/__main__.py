@@ -87,12 +87,12 @@ def cmd_scan(args):
     return hosts
 
 
-def _confirm_scope(args):
+def _confirm_scope(args, usernames, passwords):
     if args.i_own_this_network:
         return True
     print(BANNER, file=sys.stderr)
-    print(f"即将对网段 {args.subnet} 尝试登录 {len(args.usernames)} 个用户名 x "
-          f"{len(args.passwords)} 个密码的组合。", file=sys.stderr)
+    print(f"即将对网段 {args.subnet} 尝试登录 {len(usernames)} 个用户名 x "
+          f"{len(passwords)} 个密码的组合。", file=sys.stderr)
     try:
         ans = input("你确认这整个网段的设备都归你所有或已获得明确授权测试吗? 输入 yes 继续: ")
     except EOFError:
@@ -101,15 +101,14 @@ def _confirm_scope(args):
 
 
 def cmd_audit(args):
-    if not _confirm_scope(args):
+    usernames = load_list(args.usernames_extra, args.username_file) or list(DEFAULT_USERNAMES)
+    passwords = load_list(args.passwords_extra, args.password_file) or list(DEFAULT_PASSWORDS)
+
+    if not _confirm_scope(args, usernames, passwords):
         print("已取消。", file=sys.stderr)
         return 1
 
     hosts = cmd_scan(args)
-
-    usernames = load_list(args.usernames_extra, args.username_file) or list(DEFAULT_USERNAMES)
-    passwords = load_list(args.passwords_extra, args.password_file) or list(DEFAULT_PASSWORDS)
-    args.usernames, args.passwords = usernames, passwords  # for the confirmation message above
 
     print(f"\n[*] 用户名 {len(usernames)} 个 x 密码 {len(passwords)} 个,"
           f"对发现的服务逐个尝试(每台设备连续失败 {args.max_fail} 次后跳过)...",
