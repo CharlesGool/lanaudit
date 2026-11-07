@@ -106,7 +106,10 @@ def _detect_lockout(timeline):
 def _preflight_check(args):
     import ipaddress
     net = ipaddress.ip_network(args.subnet, strict=False)
-    sample_ip = str(next(net.hosts()))
+    # .hosts() is a generator for most networks but a plain list for /31 and
+    # /32 (no distinct network/broadcast address to exclude there) -- iter()
+    # makes next() work either way.
+    sample_ip = str(next(iter(net.hosts()), net.network_address))
     if discovery.transparent_proxy_warning(sample_ip):
         print(
             "\n[!] 警告: 这台机器上好像有一个系统级透明代理/VPN(比如开着 TUN 模式的"
@@ -125,12 +128,58 @@ def _preflight_check(args):
                 raise SystemExit(1)
 
 
+def _parse_extra_ports(args):
+    port_nums = load_list([str(p) for p in (args.extra_ports or [])], args.port_file)
+    service_overrides = {}
+    for entry in args.port_services or []:
+        port_str, _, svc = entry.partition(":")
+        if port_str.strip().isdigit() and svc:
+            service_overrides[int(port_str)] = svc
+    extra = {}
+    for p in port_nums:
+        p = int(p)
+        extra[p] = service_overrides.get(p, "unknown")
+    extra.update(service_overrides)  # a --service for a port not in --port still counts
+    return extra
+
+
 def cmd_scan(args):
+    """CLI entry point for `scan` -- returns a process exit code."""
+    _run_scan(args)
+    return 0
+
+
+def _run_scan(args):
+    """The actual scan, returning the discovered hosts. Shared by `cmd_scan`
+    (which must return an int exit code to the CLI, not this) and `cmd_audit`
+    (which needs the hosts list to run credential checks against)."""
     print(BANNER, file=sys.stderr)
     _preflight_check(args)
-    print(f"[*] 正在扫描 {args.subnet} ...", file=sys.stderr)
+    extra_ports = _parse_extra_ports(args)
+    ports = list(range(1, 65536)) if args.full else None
+    if args.full:
+        import ipaddress as _ipaddress
+        n_hosts = _ipaddress.ip_network(args.subnet, strict=False).num_addresses
+        n_tasks = max(n_hosts - 2, 1) * 65535
+        if n_tasks > 2_000_000 and not args.force:
+            print(
+                f"[!] --full 扫 {args.subnet} 全部端口,粗算要提交约 {n_tasks:,} 个任务,"
+                f"这台 Python 实现会在提交阶段就占用大量内存、花很久——不是为扫整个 /24 "
+                f"设计的。建议把 --subnet 缩到你真正关心的那一两台设备(单个 IP 用 /32,"
+                f"比如 172.22.31.21/32)。\n", file=sys.stderr)
+            try:
+                ans = input("仍要硬扫整个网段吗? 输入 yes 继续(或者用 --force 跳过这个确认): ")
+            except EOFError:
+                ans = ""
+            if ans.strip().lower() != "yes":
+                raise SystemExit(1)
+        print(f"[*] 正在扫描 {args.subnet} 的全部 1-65535 端口,这会比常见端口表慢很多...",
+              file=sys.stderr)
+    else:
+        print(f"[*] 正在扫描 {args.subnet} ...", file=sys.stderr)
     t0 = time.time()
-    hosts = discovery.scan_subnet(args.subnet, connect_timeout=args.connect_timeout,
+    hosts = discovery.scan_subnet(args.subnet, ports=ports, extra_ports=extra_ports,
+                                   connect_timeout=args.connect_timeout,
                                    read_timeout=args.timeout, max_workers=args.workers,
                                    progress_cb=_print_progress, lookup_names=not args.no_names)
     print(f"\n[*] 完成,用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
@@ -168,7 +217,7 @@ def cmd_audit(args):
         print("已取消。", file=sys.stderr)
         return 1
 
-    hosts = cmd_scan(args)
+    hosts = _run_scan(args)
 
     cap = args.max_fail if args.max_fail > 0 else None
     cap_desc = f"每台设备累计失败 {cap} 次后跳过" if cap else "每台设备会把密码表试完,不会提前放弃"
@@ -266,6 +315,23 @@ def build_parser():
                          help="跳过透明代理/VPN 的预检查警告,直接开始扫描")
     common.add_argument("--no-names", action="store_true",
                          help="不尝试反查设备名(反向 DNS / NetBIOS),扫描会快一点")
+    common.add_argument("--full", action="store_true",
+                         help="扫描全部 1-65535 端口,而不是内置的常见端口表。"
+                              "真要'假设对方会用非标准端口躲你'这种思路,就不能只扫"
+                              "自己知道的端口——但这比常见端口表慢得多,建议配合"
+                              "--subnet 只指定你关心的那一个/几个 IP(比如 x.x.x.x/32),"
+                              "并把 --workers/--connect-timeout 往上调")
+    common.add_argument("--port", dest="extra_ports", action="append", type=int,
+                         help="额外扫描的端口,可重复传入(--full 时无意义,常见端口表"
+                              "模式下用来补充你自己知道的非标准端口,比如自己改过的 SSH)")
+    common.add_argument("--port-file", help="每行一个端口号的文件,同 --port 一起用")
+    common.add_argument("--service", dest="port_services", action="append",
+                         metavar="PORT:SERVICE",
+                         help="指定某个额外端口对应什么服务,格式 PORT:SERVICE,"
+                              "比如 --port 51049 --service 51049:ssh;不指定的话"
+                              "额外端口会按 unknown 处理,弱密码测试也就不会用上它"
+                              "(--full 模式下所有端口都按端口号常规猜测,不受此项影响"
+                              "除非也传了 --service 覆盖)")
 
     s = sub.add_parser("scan", parents=[common], help="只做端口/服务发现,不尝试任何密码")
     s.set_defaults(func=cmd_scan)

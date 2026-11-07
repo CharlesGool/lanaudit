@@ -196,7 +196,19 @@ def _clean_banner(raw: bytes) -> str:
     return text[:200]
 
 
-def _scan_port(ip, port, connect_timeout, read_timeout):
+def _sniff_service_from_banner(banner: str) -> str:
+    """When a port's number tells us nothing (moved off its well-known port,
+    or found via a --full sweep with no --service hint), the banner itself
+    often still gives it away -- most usefully for SSH, since that's also
+    what `audit`'s checker registry needs to actually test it."""
+    if banner.startswith("SSH-"):
+        return "ssh"
+    if banner.startswith("220") and "FTP" in banner.upper():
+        return "ftp"
+    return ""
+
+
+def _scan_port(ip, port, connect_timeout, read_timeout, service_map):
     # Most of a /24 is dead IPs and closed/filtered ports — paying the full
     # (generously long, for proxied/relayed real services) read timeout on
     # every single one of those makes a full scan crawl. So: fail fast on
@@ -211,8 +223,11 @@ def _scan_port(ip, port, connect_timeout, read_timeout):
     except OSError:
         pass
 
-    info = PortInfo(port=port, guessed_service=COMMON_PORTS.get(port, "unknown"),
-                     banner=_clean_banner(banner))
+    clean = _clean_banner(banner)
+    guessed = service_map.get(port, "unknown")
+    if guessed == "unknown":
+        guessed = _sniff_service_from_banner(clean) or guessed
+    info = PortInfo(port=port, guessed_service=guessed, banner=clean)
     # A real but binary/line-less banner (MySQL's greeting packet, say)
     # still proves the port answered with protocol data even if there was
     # no readable text to show for it -- track that separately from what
@@ -266,8 +281,8 @@ def transparent_proxy_warning(sample_ip: str, timeout=1.0) -> bool:
     return hits == len(probe_ports)
 
 
-def scan_subnet(subnet: str, ports=None, connect_timeout=0.35, read_timeout=1.2,
-                 max_workers=200, progress_cb=None, lookup_names=True):
+def scan_subnet(subnet: str, ports=None, extra_ports=None, connect_timeout=0.35,
+                 read_timeout=1.2, max_workers=200, progress_cb=None, lookup_names=True):
     """Scan every host address in `subnet` (CIDR) for `ports`. Returns a list
     of HostResult for hosts that had at least one open port.
 
@@ -276,21 +291,30 @@ def scan_subnet(subnet: str, ports=None, connect_timeout=0.35, read_timeout=1.2,
     a connection actually succeeds, while we try to read a real banner or do
     an active protocol probe — give that one more room, especially if the
     path to the target goes through a relay/tunnel.
+
+    `extra_ports` is a {port: service} dict layered on top of the built-in
+    COMMON_PORTS table (added, not replacing it) — the only way to find a
+    service you've deliberately moved off its well-known port, since this
+    scanner never sweeps the full 1-65535 range.
     """
     net = ipaddress.ip_network(subnet, strict=False)
-    ports = ports or list(COMMON_PORTS)
+    service_map = {**COMMON_PORTS, **(extra_ports or {})}
+    ports = ports or list(service_map)
+    # .hosts() returns a plain list (not a generator) for /31 and /32 --
+    # either way a for-loop/comprehension over it works fine.
     hosts = [str(h) for h in net.hosts()]
 
     results = {}
     tasks = [(ip, p) for ip in hosts for p in ports]
     done = 0
+    report_every = max(200, len(tasks) // 500)
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_scan_port, ip, p, connect_timeout, read_timeout): (ip, p)
+        futs = {ex.submit(_scan_port, ip, p, connect_timeout, read_timeout, service_map): (ip, p)
                 for ip, p in tasks}
         for fut in concurrent.futures.as_completed(futs):
             ip, _port = futs[fut]
             done += 1
-            if progress_cb and done % 200 == 0:
+            if progress_cb and done % report_every == 0:
                 progress_cb(done, len(tasks))
             info = fut.result()
             if info is not None:
