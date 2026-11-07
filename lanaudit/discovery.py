@@ -281,10 +281,16 @@ def transparent_proxy_warning(sample_ip: str, timeout=1.0) -> bool:
     return hits == len(probe_ports)
 
 
-def scan_subnet(subnet: str, ports=None, extra_ports=None, connect_timeout=0.35,
-                 read_timeout=1.2, max_workers=200, progress_cb=None, lookup_names=True):
-    """Scan every host address in `subnet` (CIDR) for `ports`. Returns a list
-    of HostResult for hosts that had at least one open port.
+def scan_subnet(subnet: str = None, ports=None, extra_ports=None, connect_timeout=0.35,
+                 read_timeout=1.2, max_workers=200, progress_cb=None, lookup_names=True,
+                 target_ips=None):
+    """Scan hosts for `ports`. Returns a list of HostResult for hosts that
+    had at least one open port.
+
+    Give either `subnet` (a CIDR, every address in it is scanned) or
+    `target_ips` (an explicit list of addresses — the full-port two-phase
+    scan uses this to sweep 1-65535 only against hosts a first, cheap pass
+    already confirmed are alive, instead of every address in the subnet).
 
     `connect_timeout` bounds the initial connect() attempt (kept short since
     most of a /24 is dead IPs/closed ports); `read_timeout` only applies once
@@ -295,14 +301,17 @@ def scan_subnet(subnet: str, ports=None, extra_ports=None, connect_timeout=0.35,
     `extra_ports` is a {port: service} dict layered on top of the built-in
     COMMON_PORTS table (added, not replacing it) — the only way to find a
     service you've deliberately moved off its well-known port, since this
-    scanner never sweeps the full 1-65535 range.
+    scanner never sweeps the full 1-65535 range on its own.
     """
-    net = ipaddress.ip_network(subnet, strict=False)
     service_map = {**COMMON_PORTS, **(extra_ports or {})}
     ports = ports or list(service_map)
-    # .hosts() returns a plain list (not a generator) for /31 and /32 --
-    # either way a for-loop/comprehension over it works fine.
-    hosts = [str(h) for h in net.hosts()]
+    if target_ips is not None:
+        hosts = list(target_ips)
+    else:
+        net = ipaddress.ip_network(subnet, strict=False)
+        # .hosts() returns a plain list (not a generator) for /31 and /32 --
+        # either way a for-loop/comprehension over it works fine.
+        hosts = [str(h) for h in net.hosts()]
 
     results = {}
     tasks = [(ip, p) for ip in hosts for p in ports]

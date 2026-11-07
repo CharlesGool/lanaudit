@@ -156,33 +156,60 @@ def _run_scan(args):
     print(BANNER, file=sys.stderr)
     _preflight_check(args)
     extra_ports = _parse_extra_ports(args)
-    ports = list(range(1, 65536)) if args.full else None
-    if args.full:
-        import ipaddress as _ipaddress
-        n_hosts = _ipaddress.ip_network(args.subnet, strict=False).num_addresses
-        n_tasks = max(n_hosts - 2, 1) * 65535
+    t0 = time.time()
+
+    if not args.full:
+        print(f"[*] 正在扫描 {args.subnet} ...", file=sys.stderr)
+        hosts = discovery.scan_subnet(args.subnet, extra_ports=extra_ports,
+                                       connect_timeout=args.connect_timeout,
+                                       read_timeout=args.timeout, max_workers=args.workers,
+                                       progress_cb=_print_progress, lookup_names=not args.no_names)
+    else:
+        # Two phases: a cheap common-ports pass finds which addresses in the
+        # subnet actually have something listening at all, then only THOSE
+        # hosts get the expensive full 1-65535 sweep -- scanning every dead
+        # IP in a /24 across all 65535 ports is the part this tool was never
+        # going to do efficiently, and skipping dead addresses is exactly
+        # what a real attacker's recon would do too (no point port-sweeping
+        # an address nothing answers on at all).
+        print(f"[*] 第一阶段:用常见端口表快速摸一遍 {args.subnet},找出哪些地址在线...",
+              file=sys.stderr)
+        live_hosts = discovery.scan_subnet(args.subnet, extra_ports=extra_ports,
+                                            connect_timeout=args.connect_timeout,
+                                            read_timeout=args.timeout, max_workers=args.workers,
+                                            progress_cb=_print_progress, lookup_names=False)
+        live_ips = [h.ip for h in live_hosts]
+        print(f"\n[*] 第一阶段完成,用时 {time.time()-t0:.1f}s,{len(live_ips)} 台地址有响应",
+              file=sys.stderr)
+
+        n_tasks = len(live_ips) * 65535
         if n_tasks > 2_000_000 and not args.force:
             print(
-                f"[!] --full 扫 {args.subnet} 全部端口,粗算要提交约 {n_tasks:,} 个任务,"
-                f"这台 Python 实现会在提交阶段就占用大量内存、花很久——不是为扫整个 /24 "
-                f"设计的。建议把 --subnet 缩到你真正关心的那一两台设备(单个 IP 用 /32,"
-                f"比如 172.22.31.21/32)。\n", file=sys.stderr)
+                f"[!] 这 {len(live_ips)} 台在线设备全部做 --full 全端口扫描,粗算约 "
+                f"{n_tasks:,} 个任务,这台 Python 实现会在提交阶段就占用大量内存、花很久。"
+                f"真的全都要扫的话继续,或者改用 --subnet 只对着你最关心的那几台单独跑。\n",
+                file=sys.stderr)
             try:
-                ans = input("仍要硬扫整个网段吗? 输入 yes 继续(或者用 --force 跳过这个确认): ")
+                ans = input("继续对这些设备做全端口扫描吗? 输入 yes 继续(或者用 --force 跳过这个确认): ")
             except EOFError:
                 ans = ""
             if ans.strip().lower() != "yes":
                 raise SystemExit(1)
-        print(f"[*] 正在扫描 {args.subnet} 的全部 1-65535 端口,这会比常见端口表慢很多...",
-              file=sys.stderr)
-    else:
-        print(f"[*] 正在扫描 {args.subnet} ...", file=sys.stderr)
-    t0 = time.time()
-    hosts = discovery.scan_subnet(args.subnet, ports=ports, extra_ports=extra_ports,
-                                   connect_timeout=args.connect_timeout,
-                                   read_timeout=args.timeout, max_workers=args.workers,
-                                   progress_cb=_print_progress, lookup_names=not args.no_names)
-    print(f"\n[*] 完成,用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
+
+        if not live_ips:
+            hosts = []
+        else:
+            print(f"[*] 第二阶段:对这 {len(live_ips)} 台地址扫描全部 1-65535 端口...",
+                  file=sys.stderr)
+            t1 = time.time()
+            hosts = discovery.scan_subnet(target_ips=live_ips, ports=list(range(1, 65536)),
+                                           extra_ports=extra_ports,
+                                           connect_timeout=args.connect_timeout,
+                                           read_timeout=args.timeout, max_workers=args.workers,
+                                           progress_cb=_print_progress, lookup_names=not args.no_names)
+            print(f"\n[*] 第二阶段完成,用时 {time.time()-t1:.1f}s", file=sys.stderr)
+
+    print(f"\n[*] 完成,总用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
           file=sys.stderr)
     if hosts:
         print("\n" + _scan_table(hosts))
