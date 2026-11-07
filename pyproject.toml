@@ -22,3 +22,6 @@ lanaudit = "lanaudit.__main__:main"
 
 [tool.setuptools]
 packages = ["lanaudit", "lanaudit.checkers"]
+
+[tool.setuptools.package-data]
+lanaudit = ["data/*.txt"]

@@ -39,6 +39,18 @@ def _print_progress(done, total):
     print(f"\r扫描中... {done}/{total}", end="", file=sys.stderr, flush=True)
 
 
+def _findings_table(findings):
+    cols = [("IP", "ip"), ("端口", "port"), ("服务", "service"),
+            ("用户名", "username"), ("密码", "password")]
+    rows = [[str(f[key]) if f[key] != "" else "(空)" for _, key in cols] for f in findings]
+    widths = [max(len(h), *(len(r[i]) for r in rows)) for i, (h, _) in enumerate(cols)]
+    def fmt_row(cells):
+        return "  ".join(c.ljust(w) for c, w in zip(cells, widths))
+    lines = [fmt_row([h for h, _ in cols]), fmt_row(["-" * w for w in widths])]
+    lines += [fmt_row(r) for r in rows]
+    return "\n".join(lines)
+
+
 def _preflight_check(args):
     import ipaddress
     net = ipaddress.ip_network(args.subnet, strict=False)
@@ -144,6 +156,8 @@ def cmd_audit(args):
                     break
 
     print(f"\n[*] 完成,共 {len(findings)} 处弱密码/无密码可登录。", file=sys.stderr)
+    if findings:
+        print("\n" + _findings_table(findings))
     if args.json:
         data = report.discovery_to_dict(hosts)
         report.write_json(args.json, {"hosts": data, "findings": findings})

@@ -44,13 +44,13 @@ def render_markdown(subnet, hosts, findings):
     if not findings:
         lines.append("本次没有用提供的用户名/密码组合测出任何能登录的服务。")
     else:
+        lines.append("| IP | 端口 | 服务 | 用户名 | 密码 | 风险说明 |")
+        lines.append("|---|---|---|---|---|---|")
         for f in findings:
             hint = RISK_HINTS.get(f["service"], "")
             pw_display = f["password"] if f["password"] else "(空密码)"
-            lines.append(
-                f"- **{f['ip']}:{f['port']}** ({f['service']}) — "
-                f"用户名 `{f['username']}` / 密码 `{pw_display}` 登录成功。{hint}"
-            )
+            lines.append(f"| {f['ip']} | {f['port']} | {f['service']} | "
+                         f"`{f['username']}` | `{pw_display}` | {hint} |")
     lines.append("")
     lines.append("---")
     lines.append("这份报告只对你在命令行里指定的网段和账号密码生效,没有尝试任何其他网络或密码。")
