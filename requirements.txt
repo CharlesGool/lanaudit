@@ -1,0 +1,4 @@
+requests>=2.28
+urllib3>=1.26
+# Optional, enables the SSH checker. Leave commented out if you don't need it.
+# paramiko>=3.0

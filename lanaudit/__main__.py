@@ -1,0 +1,198 @@
+"""lanaudit CLI.
+
+  lanaudit scan  --subnet 192.168.1.0/24
+  lanaudit audit --subnet 192.168.1.0/24 --i-own-this-network \
+                  --password "myOldWifiPassword" --password-file extra.txt
+
+`scan` only does read-only port/banner discovery — no credentials are ever
+sent. `audit` additionally tries a short list of default/known-weak
+passwords (plus anything you supply) against the services it finds, so you
+can tell whether any device on your own network is still using one of them.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+
+# Banners/titles pulled off random devices can contain bytes that don't map
+# cleanly to the host's console code page (this bit Windows cmd/PowerShell
+# with non-UTF-8 code pages). Never let a garbled banner crash the scan.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+from . import discovery, report
+from .checkers import REGISTRY
+from .wordlists import DEFAULT_PASSWORDS, DEFAULT_USERNAMES, load_list
+
+BANNER = """\
+lanaudit — local-network service & weak-password auditor
+只能用于你自己拥有或已获得明确授权测试的网络。对别人的网络账号/设备做密码尝试,
+未经允许在大多数地方是违法的(例如美国的 CFAA、中国的网络安全法)。
+"""
+
+
+def _print_progress(done, total):
+    print(f"\r扫描中... {done}/{total}", end="", file=sys.stderr, flush=True)
+
+
+def _preflight_check(args):
+    import ipaddress
+    net = ipaddress.ip_network(args.subnet, strict=False)
+    sample_ip = str(next(net.hosts()))
+    if discovery.transparent_proxy_warning(sample_ip):
+        print(
+            "\n[!] 警告: 这台机器上好像有一个系统级透明代理/VPN(比如开着 TUN 模式的"
+            "Clash/mihomo、某些企业 VPN),会让任意端口的 connect() 都立刻'成功',"
+            "导致扫出来的'开放端口'大量是假的。\n"
+            "    建议:先关掉代理的 TUN 模式,或者把这个网段加入代理的直连/绕过名单,"
+            "再重新扫描。\n"
+            "    报告里没有抓到真实协议回应(banner/HTTP 响应)的端口会被标成"
+            "'未确认',请不要直接采信这些端口。\n", file=sys.stderr)
+        if not args.force:
+            try:
+                ans = input("仍要继续吗? (结果里的'未确认'端口会不可信) 输入 yes 继续: ")
+            except EOFError:
+                ans = ""
+            if ans.strip().lower() != "yes":
+                raise SystemExit(1)
+
+
+def cmd_scan(args):
+    print(BANNER, file=sys.stderr)
+    _preflight_check(args)
+    print(f"[*] 正在扫描 {args.subnet} ...", file=sys.stderr)
+    t0 = time.time()
+    hosts = discovery.scan_subnet(args.subnet, timeout=args.timeout,
+                                   max_workers=args.workers, progress_cb=_print_progress)
+    print(f"\n[*] 完成,用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
+          file=sys.stderr)
+    for h in hosts:
+        print(f"\n{h.ip}")
+        for p in h.ports:
+            label = p.http_title or p.http_server or p.banner
+            tag = "" if p.confirmed else "  [未确认,可能是代理误判]"
+            print(f"  {p.port:>6}  {p.guessed_service:<8} {label[:80]}{tag}")
+    if args.json:
+        report.write_json(args.json, report.discovery_to_dict(hosts))
+        print(f"\n[*] JSON 已保存到 {args.json}", file=sys.stderr)
+    if args.markdown:
+        with open(args.markdown, "w", encoding="utf-8") as fh:
+            fh.write(report.render_markdown(args.subnet, hosts, []))
+        print(f"[*] Markdown 报告已保存到 {args.markdown}", file=sys.stderr)
+    return hosts
+
+
+def _confirm_scope(args):
+    if args.i_own_this_network:
+        return True
+    print(BANNER, file=sys.stderr)
+    print(f"即将对网段 {args.subnet} 尝试登录 {len(args.usernames)} 个用户名 x "
+          f"{len(args.passwords)} 个密码的组合。", file=sys.stderr)
+    try:
+        ans = input("你确认这整个网段的设备都归你所有或已获得明确授权测试吗? 输入 yes 继续: ")
+    except EOFError:
+        return False
+    return ans.strip().lower() == "yes"
+
+
+def cmd_audit(args):
+    if not _confirm_scope(args):
+        print("已取消。", file=sys.stderr)
+        return 1
+
+    hosts = cmd_scan(args)
+
+    usernames = load_list(args.usernames_extra, args.username_file) or list(DEFAULT_USERNAMES)
+    passwords = load_list(args.passwords_extra, args.password_file) or list(DEFAULT_PASSWORDS)
+    args.usernames, args.passwords = usernames, passwords  # for the confirmation message above
+
+    print(f"\n[*] 用户名 {len(usernames)} 个 x 密码 {len(passwords)} 个,"
+          f"对发现的服务逐个尝试(每台设备连续失败 {args.max_fail} 次后跳过)...",
+          file=sys.stderr)
+
+    findings = []
+    for h in hosts:
+        for p in h.ports:
+            checker = REGISTRY.get(p.guessed_service)
+            if checker is None:
+                continue
+            fail_count = 0
+            hit = False
+            for username in usernames:
+                if hit or fail_count >= args.max_fail:
+                    break
+                for password in passwords:
+                    if fail_count >= args.max_fail:
+                        break
+                    result = checker(h.ip, p.port, username, password, args.timeout)
+                    time.sleep(args.delay)
+                    if result is True:
+                        findings.append({"ip": h.ip, "port": p.port,
+                                          "service": p.guessed_service,
+                                          "username": username, "password": password})
+                        print(f"\n[!] {h.ip}:{p.port} ({p.guessed_service}) "
+                              f"{username}/{password or '(空)'} 登录成功", file=sys.stderr)
+                        hit = True
+                        break
+                    if result is False:
+                        fail_count += 1
+                if hit:
+                    break
+
+    print(f"\n[*] 完成,共 {len(findings)} 处弱密码/无密码可登录。", file=sys.stderr)
+    if args.json:
+        data = report.discovery_to_dict(hosts)
+        report.write_json(args.json, {"hosts": data, "findings": findings})
+    if args.markdown:
+        with open(args.markdown, "w", encoding="utf-8") as fh:
+            fh.write(report.render_markdown(args.subnet, hosts, findings))
+        print(f"[*] Markdown 报告已保存到 {args.markdown}", file=sys.stderr)
+    return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="lanaudit", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--subnet", required=True, help="CIDR,例如 192.168.1.0/24")
+    common.add_argument("--timeout", type=float, default=0.6, help="每次连接超时(秒)")
+    common.add_argument("--workers", type=int, default=60, help="扫描并发数")
+    common.add_argument("--json", help="把结果写成 JSON 文件")
+    common.add_argument("--markdown", help="把结果写成 Markdown 报告文件")
+    common.add_argument("--force", action="store_true",
+                         help="跳过透明代理/VPN 的预检查警告,直接开始扫描")
+
+    s = sub.add_parser("scan", parents=[common], help="只做端口/服务发现,不尝试任何密码")
+    s.set_defaults(func=cmd_scan)
+
+    a = sub.add_parser("audit", parents=[common],
+                        help="在 scan 的基础上,用指定的用户名/密码尝试登录发现的服务")
+    a.add_argument("--i-own-this-network", action="store_true",
+                    help="跳过交互式确认(用于非交互/CI 环境,仍然只在确认过的范围内运行)")
+    a.add_argument("--username", dest="usernames_extra", action="append",
+                    help="额外尝试的用户名,可重复传入")
+    a.add_argument("--password", dest="passwords_extra", action="append",
+                    help="额外尝试的密码,可重复传入(你怀疑泄露的密码放这里)")
+    a.add_argument("--username-file", help="每行一个用户名的文件")
+    a.add_argument("--password-file", help="每行一个密码的文件")
+    a.add_argument("--max-fail", type=int, default=6,
+                    help="同一台设备连续失败多少次后跳过,避免触发锁定(默认 6)")
+    a.add_argument("--delay", type=float, default=0.3, help="每次尝试之间的延迟(秒)")
+    a.set_defaults(func=cmd_audit)
+
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
