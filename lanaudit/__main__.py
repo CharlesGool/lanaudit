@@ -122,9 +122,10 @@ def cmd_audit(args):
 
     hosts = cmd_scan(args)
 
+    cap = args.max_fail if args.max_fail > 0 else None
+    cap_desc = f"每台设备连续失败 {cap} 次后跳过" if cap else "每台设备会把密码表试完,不会提前放弃"
     print(f"\n[*] 用户名 {len(usernames)} 个 x 密码 {len(passwords)} 个,"
-          f"对发现的服务逐个尝试(每台设备连续失败 {args.max_fail} 次后跳过)...",
-          file=sys.stderr)
+          f"对发现的服务逐个尝试({cap_desc})...", file=sys.stderr)
 
     findings = []
     for h in hosts:
@@ -135,10 +136,10 @@ def cmd_audit(args):
             fail_count = 0
             hit = False
             for username in usernames:
-                if hit or fail_count >= args.max_fail:
+                if hit or (cap and fail_count >= cap):
                     break
                 for password in passwords:
-                    if fail_count >= args.max_fail:
+                    if cap and fail_count >= cap:
                         break
                     result = checker(h.ip, p.port, username, password, args.timeout)
                     time.sleep(args.delay)
@@ -206,8 +207,10 @@ def build_parser():
                     help="额外尝试的密码,可重复传入(你怀疑泄露的密码放这里)")
     a.add_argument("--username-file", help="每行一个用户名的文件")
     a.add_argument("--password-file", help="每行一个密码的文件")
-    a.add_argument("--max-fail", type=int, default=6,
-                    help="同一台设备连续失败多少次后跳过,避免触发锁定(默认 6)")
+    a.add_argument("--max-fail", type=int, default=0,
+                    help="同一台设备连续失败多少次后跳过。默认 0 = 不设上限,"
+                         "密码表会试完;担心把有登录锁定机制的设备越试越锁,"
+                         "可以设一个数,比如 6")
     a.add_argument("--delay", type=float, default=0.3, help="每次尝试之间的延迟(秒)")
     a.set_defaults(func=cmd_audit)
 
