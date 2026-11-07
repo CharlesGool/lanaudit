@@ -97,6 +97,66 @@ def _http_probe(ip, port, use_tls, timeout):
         return b""
 
 
+# Active probes for protocols that stay silent until the client speaks first
+# (so a passive recv() after connect() tells us nothing — and nothing is
+# exactly what a transparent-proxy false "open" port also looks like).
+# Each returns raw response bytes, or b"" if nothing protocol-shaped came back.
+
+_REDIS_PING = b"*1\r\n$4\r\nPING\r\n"
+# Classic "cookie-less" RDP X.224 Connection Request (TPKT + X.224 CR with an
+# RDP Negotiation Request requesting SSL/CredSSP/RDP) — widely used by RDP
+# health-check tools to elicit a Connection Confirm without a real session.
+# Written as an explicit byte list (not a hex string) so a stray character
+# can't silently corrupt the packet.
+_RDP_CONNECTION_REQUEST = bytes([
+    0x03, 0x00, 0x00, 0x13,  # TPKT: version 3, reserved, length=0x0013 (19 bytes)
+    0x0e, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,  # X.224 Connection Request TPDU
+    0x01, 0x00, 0x08, 0x00, 0x0b, 0x00, 0x00, 0x00,  # RDP Negotiation Request
+])
+
+
+def _active_probe(ip, port, timeout, send: bytes, read_len=2048):
+    try:
+        s = socket.create_connection((ip, port), timeout=timeout)
+    except OSError:
+        return b""
+    try:
+        s.sendall(send)
+        s.settimeout(timeout)
+        return s.recv(read_len)
+    except OSError:
+        return b""
+    finally:
+        try:
+            s.close()
+        except OSError:
+            pass
+
+
+def _probe_redis(ip, port, timeout):
+    resp = _active_probe(ip, port, timeout, _REDIS_PING)
+    return resp if resp[:1] in (b"+", b"-") else b""
+
+
+def _probe_rdp(ip, port, timeout):
+    resp = _active_probe(ip, port, timeout, _RDP_CONNECTION_REQUEST, read_len=64)
+    # TPKT header (0x03 0x00) followed by an X.224 Connection Confirm (0xd0).
+    return resp if resp[:2] == b"\x03\x00" and b"\xd0" in resp[:8] else b""
+
+
+def _probe_rtsp(ip, port, timeout):
+    req = f"OPTIONS rtsp://{ip}:{port}/ RTSP/1.0\r\nCSeq: 1\r\n\r\n".encode()
+    resp = _active_probe(ip, port, timeout, req)
+    return resp if resp.startswith(b"RTSP/1.0") else b""
+
+
+ACTIVE_PROBES = {
+    "redis": _probe_redis,
+    "rdp": _probe_rdp,
+    "rtsp": _probe_rtsp,
+}
+
+
 def _parse_http(raw: bytes):
     text = raw.decode("utf-8", errors="replace")
     title = ""
@@ -118,7 +178,7 @@ def _scan_port(ip, port, timeout):
     s = _tcp_connect(ip, port, timeout)
     if s is None:
         return None
-    banner = _grab_banner(s, min(timeout, 0.6))
+    banner = _grab_banner(s, max(timeout, 1.0))
     try:
         s.close()
     except OSError:
@@ -133,6 +193,13 @@ def _scan_port(ip, port, timeout):
             title, server, auth = _parse_http(raw)
             info.http_title, info.http_server, info.http_auth = title, server, auth
             info.guessed_service = "https" if port in HTTPS_PORTS else "http"
+    elif info.guessed_service in ACTIVE_PROBES and not info.banner:
+        # Services that stay silent until spoken to: a bare connect() success
+        # tells us nothing (and is exactly what a transparent proxy fakes), so
+        # send the real handshake and only trust a protocol-shaped reply.
+        resp = ACTIVE_PROBES[info.guessed_service](ip, port, timeout)
+        if resp:
+            info.banner = resp.decode("utf-8", errors="replace").strip()[:200]
 
     info.confirmed = bool(info.banner or info.http_title or info.http_server or info.http_auth)
     return info

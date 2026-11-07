@@ -161,7 +161,9 @@ def build_parser():
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--subnet", required=True, help="CIDR,例如 192.168.1.0/24")
-    common.add_argument("--timeout", type=float, default=0.6, help="每次连接超时(秒)")
+    common.add_argument("--timeout", type=float, default=1.2,
+                         help="每次连接/读取超时(秒)。局域网里如果有透明代理/TUN VPN,"
+                              "真实服务的数据可能要多转一道手,适当调大能减少漏判")
     common.add_argument("--workers", type=int, default=60, help="扫描并发数")
     common.add_argument("--json", help="把结果写成 JSON 文件")
     common.add_argument("--markdown", help="把结果写成 Markdown 报告文件")
