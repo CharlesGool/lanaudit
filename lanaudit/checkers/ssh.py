@@ -1,7 +1,16 @@
 """SSH password-auth check. Requires `paramiko` (optional dependency)."""
+import logging
+
 try:
     import paramiko
     _HAVE_PARAMIKO = True
+    # paramiko logs every dropped/reset connection (which is most of a scan's
+    # misses, not an actual problem) through its own logger at ERROR level,
+    # which by default prints a full traceback straight to stderr — drowning
+    # out the one line per host that actually matters. Our caller already
+    # treats these as a normal "inconclusive" result; no need to also spam
+    # the terminal.
+    logging.getLogger("paramiko").setLevel(logging.CRITICAL)
 except ImportError:
     _HAVE_PARAMIKO = False
 
