@@ -19,10 +19,39 @@ Scan your own LAN for exposed services, then check them against a short list of 
 ## 安装 / Install
 
 ```bash
+git clone https://github.com/CharlesGool/lanaudit.git && cd lanaudit
 pip install -r requirements.txt
 # 想测 SSH 弱密码的话再装一个：
 pip install paramiko
 ```
+
+Debian 12/13、Ubuntu 23.04+ 这些系统的系统 Python 默认不让直接 `pip install`
+(会报 `externally-managed-environment`)。用下面任意一种方式都行：
+
+```bash
+# 方式一: 建一个虚拟环境(推荐)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 方式二: 明确告诉 pip 你知道风险(只装了 requests/urllib3/paramiko 这几个常见包,问题不大)
+pip install --break-system-packages -r requirements.txt
+```
+
+## 跨网段扫描一定要在目标网段内部运行
+
+如果你的电脑和要扫的局域网不在同一个地方（比如你人在甲地，要扫的是异地的
+乙地家庭网络），**不要**在甲地的电脑上直接扫乙地的网段——哪怕甲乙之间用
+Tailscale/VPN 连着也一样：
+
+- 跨地域的隧道会让真实服务的握手变慢、不稳定，结果时有时无。
+- 如果你电脑本身开着全局代理/TUN 模式的 VPN（很多人用 Clash/mihomo 的 TUN
+  模式），它会让所有 TCP 连接看起来都"连上了"，不管目标端口到底有没有在
+  监听——这时候扫出来的"开放端口"基本全是假的（`lanaudit` 会自动检测这种
+  情况并警告你，见下面"预检查"）。
+
+正确做法：把这个仓库 `git clone` 到**那个局域网内部**的一台 Linux 机器上
+（随便一台你已经能登录的就行），在那台机器上跑 `lanaudit`，再把生成的
+`.md`/`.json` 报告传回来看。
 
 ## 用法 / Usage
 
