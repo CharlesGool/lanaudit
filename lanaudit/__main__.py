@@ -59,14 +59,21 @@ def _findings_table(findings):
     return _table([h for h, _ in cols], rows)
 
 
-def _scan_table(hosts):
+def _scan_table(hosts, proxy_suspected=False):
     headers = ["IP", "设备名", "端口", "服务", "信息"]
+    # The "proxy misjudgment" caveat is only accurate when the preflight
+    # transparent_proxy_warning() check actually fired for this run -- most
+    # "未确认" ports are just protocols that never send an unsolicited
+    # banner and don't answer HTTP (SMB/RPC/RDP-handshakeless/VMConnect/
+    # WS-Discovery etc.); labeling every one of those as a possible proxy
+    # artifact when no proxy was ever detected was misleading.
+    suffix = "[未确认,可能是代理误判]" if proxy_suspected else "[未确认,协议未主动探测到,仅按端口号猜测]"
     rows = []
     for h in hosts:
         for i, p in enumerate(h.ports):
             label = p.http_title or p.http_server or p.banner
             if not p.confirmed:
-                label = (label + " " if label else "") + "[未确认,可能是代理误判]"
+                label = (label + " " if label else "") + suffix
             rows.append([h.ip if i == 0 else "", h.name if i == 0 else "",
                          str(p.port), p.guessed_service, label[:80]])
     return _table(headers, rows)
@@ -111,7 +118,8 @@ def _preflight_check(args):
     # /32 (no distinct network/broadcast address to exclude there) -- iter()
     # makes next() work either way.
     sample_ip = str(next(iter(net.hosts()), net.network_address))
-    if discovery.transparent_proxy_warning(sample_ip):
+    proxy_suspected = discovery.transparent_proxy_warning(sample_ip)
+    if proxy_suspected:
         print(
             "\n[!] 警告: 这台机器上好像有一个系统级透明代理/VPN(比如开着 TUN 模式的"
             "Clash/mihomo、某些企业 VPN),会让任意端口的 connect() 都立刻'成功',"

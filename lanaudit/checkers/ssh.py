@@ -15,6 +15,37 @@ except ImportError:
     _HAVE_PARAMIKO = False
 
 
+def precheck(ip, port, timeout):
+    """Called once per target: does this sshd even accept password auth at
+    all? A key-only server (password auth disabled, the now-common hardened
+    state) will reject every single one of 10k+ passwords identically — no
+    point spending the whole list to learn that, when one auth_none probe
+    tells us up front via the server's advertised auth-method list."""
+    if not _HAVE_PARAMIKO:
+        return False
+    transport = None
+    try:
+        transport = paramiko.Transport((ip, port))
+        transport.start_client(timeout=timeout)
+        try:
+            transport.auth_none("lanaudit-precheck")
+            return True  # no auth required at all -- worth trying real creds
+        except paramiko.BadAuthenticationType as e:
+            return "password" in e.allowed_types
+        except paramiko.AuthenticationException:
+            return True
+    except Exception:
+        # Connection/protocol error -- let the real attempts surface it
+        # rather than silently skipping a target we couldn't even probe.
+        return True
+    finally:
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
+
+
 def check(ip, port, username, password, timeout):
     if not _HAVE_PARAMIKO:
         return None

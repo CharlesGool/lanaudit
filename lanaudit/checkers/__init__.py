@@ -16,7 +16,7 @@ answer again on every single attempt.
 """
 import functools
 
-from .ssh import check as check_ssh
+from .ssh import check as check_ssh, precheck as precheck_ssh
 from .ftp import check as check_ftp
 from .telnet import check as check_telnet
 from .http_basic import check as check_http_basic, precheck as precheck_http_basic
@@ -36,4 +36,5 @@ REGISTRY = {
 PRECHECKS = {
     "http": functools.partial(precheck_http_basic, use_tls=False),
     "https": functools.partial(precheck_http_basic, use_tls=True),
+    "ssh": precheck_ssh,
 }
