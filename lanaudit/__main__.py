@@ -98,7 +98,14 @@ def _detect_lockout(timeline):
     results = [r for _, r in timeline]
     last_real = max((i for i, r in enumerate(results) if r is False), default=-1)
     if last_real < 0:
-        return None  # never got a real rejection at all -- nothing to compare against
+        # Never got a real rejection at all -- either nothing to compare
+        # against, or (the case this also catches) the target was never
+        # reachable long enough for even one real auth attempt to
+        # complete, e.g. our own concurrency overloading it into resetting
+        # connections mid-handshake from the very first batch.
+        if len(results) >= 30 and all(r is None for r in results):
+            return {"rejected": 0, "stalled": len(results)}
+        return None
     tail = results[last_real + 1:]
     if len(tail) < 5:
         return None
@@ -353,6 +360,7 @@ def cmd_audit(args):
 
         lockout_hit = threading.Event()
         real_rejections_seen = [0]
+        attempts_made = [0]
         recent = collections.deque(maxlen=10)
 
         def attempt(seq, username, password):
@@ -362,6 +370,7 @@ def cmd_audit(args):
             if args.delay:
                 time.sleep(args.delay)
             with lock:
+                attempts_made[0] += 1
                 if result is True:
                     found.set()
                 elif result is False:
@@ -381,9 +390,34 @@ def cmd_audit(args):
                 if (real_rejections_seen[0] >= 1 and len(recent) == recent.maxlen
                         and all(r is None for r in recent)):
                     lockout_hit.set()
+                # Backstop for the case with *zero* real rejections ever --
+                # e.g. a target whose SSH server gets overloaded by our own
+                # concurrency and resets connections before completing the
+                # handshake at all, so the checker never sees a real True
+                # or False to begin with (observed directly against an
+                # OpenSSH-for-Windows target: a hand-written paramiko probe
+                # failed with ConnectionResetError in under 0.1s). Past a
+                # few dozen attempts with nothing but None, something's
+                # wrong with reaching this target, not with the passwords.
+                elif (attempts_made[0] >= 40 and not found.is_set()
+                        and real_rejections_seen[0] == 0
+                        and len(recent) == recent.maxlen and all(r is None for r in recent)):
+                    lockout_hit.set()
             return seq, username, password, result, False
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.audit_workers) as ex:
+        # SSH's handshake is a full key exchange, not a cheap HTTP request --
+        # real-world sshd implementations (OpenSSH for Windows included)
+        # tolerate far fewer concurrent *unauthenticated* connections than
+        # args.audit_workers assumes. Past that point new connections start
+        # getting reset mid-handshake (observed directly: a hand-written
+        # paramiko test against an overloaded target failed in under 0.1s
+        # with ConnectionResetError, not a real auth rejection) -- which
+        # also means the one attempt with the *correct* credentials can get
+        # reset just as easily as a wrong one, so the run never finds it
+        # and just grinds the whole list at a crawl. Capping SSH's
+        # concurrency low avoids causing the overload in the first place.
+        target_workers = min(args.audit_workers, 4) if p.guessed_service == "ssh" else args.audit_workers
+        with concurrent.futures.ThreadPoolExecutor(max_workers=target_workers) as ex:
             futs = [ex.submit(attempt, i, u, pw) for i, (u, pw) in enumerate(combos)]
             for fut in concurrent.futures.as_completed(futs):
                 seq, username, password, result, skipped = fut.result()
@@ -429,8 +463,13 @@ def cmd_audit(args):
         print(f"\n[*] {len(lockout_suspects)} 处疑似触发了设备自己的失败锁定/封禁"
               f"(前面还在正常拒绝,后面一段全部连不上/没反应):", file=sys.stderr)
         for s in lockout_suspects:
-            print(f"  - {s['ip']}:{s['port']} ({s['service']}): 正常拒绝 {s['rejected']} 次后,"
-                  f"后面 {s['stalled']} 次全部无响应", file=sys.stderr)
+            if s["rejected"] == 0:
+                print(f"  - {s['ip']}:{s['port']} ({s['service']}): 从一开始 {s['stalled']} 次尝试"
+                      "全部连不上/没反应,一次正常拒绝都没有过——大概率是并发把这个目标打垮了"
+                      "(连接被重置/超时),不是在真的测密码", file=sys.stderr)
+            else:
+                print(f"  - {s['ip']}:{s['port']} ({s['service']}): 正常拒绝 {s['rejected']} 次后,"
+                      f"后面 {s['stalled']} 次全部无响应", file=sys.stderr)
     if args.json:
         data = report.discovery_to_dict(hosts)
         report.write_json(args.json, {"hosts": data, "findings": findings})
