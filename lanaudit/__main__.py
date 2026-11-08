@@ -312,7 +312,9 @@ def cmd_audit(args):
         print("已取消。", file=sys.stderr)
         return 1
 
+    t_audit_start = time.time()
     hosts = _run_scan(args)
+    t_scan_done = time.time()
 
     cap = args.max_fail if args.max_fail > 0 else None
     cap_desc = f"每个目标累计失败 {cap} 次后跳过" if cap else "每个目标会把密码表试完,不会提前放弃"
@@ -416,7 +418,11 @@ def cmd_audit(args):
         print(f"[*] 其中 {skipped_count} 个目标一看就不需要测密码(比如网页压根没启用 "
               f"Basic 认证),直接跳过了,没有浪费密码表去反复确认这件事", file=sys.stderr)
 
-    print(f"\n[*] 完成,共 {len(findings)} 处弱密码/无密码可登录。", file=sys.stderr)
+    t_audit_done = time.time()
+    print(f"\n[*] 密码审计用时 {t_audit_done - t_scan_done:.1f}s"
+          f"(扫描阶段 {t_scan_done - t_audit_start:.1f}s,总共 {t_audit_done - t_audit_start:.1f}s)",
+          file=sys.stderr)
+    print(f"[*] 完成,共 {len(findings)} 处弱密码/无密码可登录。", file=sys.stderr)
     if findings:
         print("\n" + _findings_table(findings))
     if lockout_suspects:

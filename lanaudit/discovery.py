@@ -364,7 +364,7 @@ def _classify_connect(ip, port, timeout):
     return "refused" if err == errno.ECONNREFUSED else "error"
 
 
-def _looks_banned(ip, ports, timeout, max_workers=32, sample_size=12):
+def _looks_banned(ip, ports, timeout, max_workers=32, sample_size=30):
     """Best-effort guess at whether *this machine specifically* is
     currently being firewalled by the target (e.g. its own fail2ban/banip
     reacting to an earlier, unrelated scan/audit against it) rather than
@@ -377,11 +377,10 @@ def _looks_banned(ip, ports, timeout, max_workers=32, sample_size=12):
     answer normally.
     """
     sample = ports[:sample_size] if len(ports) > sample_size else ports
-    results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         results = list(ex.map(lambda p: _classify_connect(ip, p, timeout), sample))
     return ("open" not in results and "refused" not in results
-            and results.count("timeout") >= 3)
+            and results.count("timeout") >= max(3, len(sample) // 2))
 
 
 def _ping_sweep(hosts, timeout=1.0, max_workers=256):
