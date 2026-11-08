@@ -337,7 +337,17 @@ def cmd_audit(args):
         fail_count = [0]
         lock = threading.Lock()
         timeline = []  # (seq, result) in submission order, filled in as completed
-        combos = [(u, pw) for u in usernames for pw in passwords]
+        # Password outer, username inner -- not the other way round. The
+        # user's own guesses were already put first in `passwords` so they
+        # get tried before the ~10k generic list, but with usernames as the
+        # outer loop that guarantee only held for whichever username comes
+        # first in DEFAULT_USERNAMES ("admin"): a real admin/administrator
+        # account wouldn't get tried with the user's own password until
+        # after the *entire* password list had already been exhausted for
+        # every earlier username. Flipping the nesting tries every
+        # username against the user's own guesses first, before moving on
+        # to the generic list.
+        combos = [(u, pw) for pw in passwords for u in usernames]
 
         lockout_hit = threading.Event()
         real_rejections_seen = [0]
