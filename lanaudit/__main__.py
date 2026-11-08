@@ -12,6 +12,7 @@ can tell whether any device on your own network is still using one of them.
 from __future__ import annotations
 
 import argparse
+import collections
 import concurrent.futures
 import sys
 import threading
@@ -284,8 +285,12 @@ def cmd_audit(args):
         timeline = []  # (seq, result) in submission order, filled in as completed
         combos = [(u, pw) for u in usernames for pw in passwords]
 
+        lockout_hit = threading.Event()
+        real_rejections_seen = [0]
+        recent = collections.deque(maxlen=10)
+
         def attempt(seq, username, password):
-            if found.is_set() or cap_hit.is_set():
+            if found.is_set() or cap_hit.is_set() or lockout_hit.is_set():
                 return seq, username, password, None, True  # skipped, not a real outcome
             result = checker(h.ip, p.port, username, password, args.timeout)
             if args.delay:
@@ -295,8 +300,21 @@ def cmd_audit(args):
                     found.set()
                 elif result is False:
                     fail_count[0] += 1
+                    real_rejections_seen[0] += 1
                     if cap and fail_count[0] >= cap:
                         cap_hit.set()
+                recent.append(result)
+                # The device was genuinely rejecting guesses (so auth was
+                # really happening), then a run of attempts in a row can't
+                # even complete the protocol handshake at all -- that's a
+                # live lockout/rate-limit kicking in right now, not noise;
+                # stop spending the rest of a huge password list on a target
+                # that's actively refusing to talk to us, exactly what
+                # --max-fail couldn't catch since those are "accepted the
+                # connection, rejected the password" failures, not this.
+                if (real_rejections_seen[0] >= 1 and len(recent) == recent.maxlen
+                        and all(r is None for r in recent)):
+                    lockout_hit.set()
             return seq, username, password, result, False
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.audit_workers) as ex:
