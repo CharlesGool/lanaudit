@@ -260,57 +260,66 @@ def cmd_audit(args):
     hosts = _run_scan(args)
 
     cap = args.max_fail if args.max_fail > 0 else None
-    cap_desc = f"每台设备累计失败 {cap} 次后跳过" if cap else "每台设备会把密码表试完,不会提前放弃"
+    cap_desc = f"每个目标累计失败 {cap} 次后跳过" if cap else "每个目标会把密码表试完,不会提前放弃"
+    targets = [(h, p, REGISTRY[p.guessed_service]) for h in hosts for p in h.ports
+               if p.guessed_service in REGISTRY]
     print(f"\n[*] 用户名 {len(usernames)} 个 x 密码 {len(passwords)} 个,"
-          f"每台设备 {args.audit_workers} 个线程并发尝试({cap_desc})...", file=sys.stderr)
+          f"{len(targets)} 个目标(设备+端口)。每个目标内部 {args.audit_workers} 个线程并发,"
+          f"目标之间也并发(最多同时 {args.target_workers} 个目标)。{cap_desc}...",
+          file=sys.stderr)
+
+    def audit_one_target(h, p, checker):
+        findings_here, lockout_here = [], None
+        found = threading.Event()
+        cap_hit = threading.Event()
+        fail_count = [0]
+        lock = threading.Lock()
+        timeline = []  # (seq, result) in submission order, filled in as completed
+        combos = [(u, pw) for u in usernames for pw in passwords]
+
+        def attempt(seq, username, password):
+            if found.is_set() or cap_hit.is_set():
+                return seq, username, password, None, True  # skipped, not a real outcome
+            result = checker(h.ip, p.port, username, password, args.timeout)
+            if args.delay:
+                time.sleep(args.delay)
+            with lock:
+                if result is True:
+                    found.set()
+                elif result is False:
+                    fail_count[0] += 1
+                    if cap and fail_count[0] >= cap:
+                        cap_hit.set()
+            return seq, username, password, result, False
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.audit_workers) as ex:
+            futs = [ex.submit(attempt, i, u, pw) for i, (u, pw) in enumerate(combos)]
+            for fut in concurrent.futures.as_completed(futs):
+                seq, username, password, result, skipped = fut.result()
+                if not skipped:
+                    timeline.append((seq, result))
+                if result is True:
+                    finding = {"ip": h.ip, "port": p.port, "service": p.guessed_service,
+                               "username": username, "password": password}
+                    findings_here.append(finding)
+                    print(f"\n[!] {h.ip}:{p.port} ({p.guessed_service}) "
+                          f"{username}/{password or '(空)'} 登录成功", file=sys.stderr)
+
+        suspect = _detect_lockout(timeline)
+        if suspect:
+            suspect.update(ip=h.ip, port=p.port, service=p.guessed_service)
+            lockout_here = suspect
+        return findings_here, lockout_here
 
     findings = []
     lockout_suspects = []
-    for h in hosts:
-        for p in h.ports:
-            checker = REGISTRY.get(p.guessed_service)
-            if checker is None:
-                continue
-            found = threading.Event()
-            cap_hit = threading.Event()
-            fail_count = [0]
-            lock = threading.Lock()
-            timeline = []  # (seq, result) in submission order, filled in as completed
-
-            combos = [(u, pw) for u in usernames for pw in passwords]
-
-            def attempt(seq, username, password):
-                if found.is_set() or cap_hit.is_set():
-                    return seq, username, password, None, True  # skipped, not a real outcome
-                result = checker(h.ip, p.port, username, password, args.timeout)
-                if args.delay:
-                    time.sleep(args.delay)
-                with lock:
-                    if result is True:
-                        found.set()
-                    elif result is False:
-                        fail_count[0] += 1
-                        if cap and fail_count[0] >= cap:
-                            cap_hit.set()
-                return seq, username, password, result, False
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=args.audit_workers) as ex:
-                futs = [ex.submit(attempt, i, u, pw) for i, (u, pw) in enumerate(combos)]
-                for fut in concurrent.futures.as_completed(futs):
-                    seq, username, password, result, skipped = fut.result()
-                    if not skipped:
-                        timeline.append((seq, result))
-                    if result is True:
-                        findings.append({"ip": h.ip, "port": p.port,
-                                          "service": p.guessed_service,
-                                          "username": username, "password": password})
-                        print(f"\n[!] {h.ip}:{p.port} ({p.guessed_service}) "
-                              f"{username}/{password or '(空)'} 登录成功", file=sys.stderr)
-
-            suspect = _detect_lockout(timeline)
-            if suspect:
-                suspect.update(ip=h.ip, port=p.port, service=p.guessed_service)
-                lockout_suspects.append(suspect)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.target_workers)) as ex:
+        futs = [ex.submit(audit_one_target, h, p, checker) for h, p, checker in targets]
+        for fut in concurrent.futures.as_completed(futs):
+            findings_here, lockout_here = fut.result()
+            findings.extend(findings_here)
+            if lockout_here:
+                lockout_suspects.append(lockout_here)
 
     print(f"\n[*] 完成,共 {len(findings)} 处弱密码/无密码可登录。", file=sys.stderr)
     if findings:
@@ -395,10 +404,14 @@ def build_parser():
                          "可以设一个数,比如 6(并发下这个数不再是\"连续\"失败,"
                          "是总的失败次数)")
     a.add_argument("--audit-workers", type=int, default=16,
-                    help="对同一台设备同一个服务,同时并发尝试几个用户名/密码组合"
+                    help="对同一个目标(一台设备的一个服务),同时并发尝试几个用户名/密码组合"
                          "(默认 16)。调大能明显提速,也正好用来看这台设备有没有"
                          "\"同 IP 短时间内多次失败就封禁/限速\"的防护——如果开大了之后"
                          "后面全部连不上,报告里会提示疑似触发了锁定")
+    a.add_argument("--target-workers", type=int, default=8,
+                    help="同时对几个目标(不同设备,或同一设备不同服务)做密码测试"
+                         "(默认 8)。之前是一个目标测完才测下一个,CPU/网络基本闲着;"
+                         "调大这个能让多台设备同时测,真正把并发用起来")
     a.add_argument("--delay", type=float, default=0.3,
                     help="每个线程每次尝试之间的延迟(秒),默认 0.3;改成 0 就是不限速")
     a.set_defaults(func=cmd_audit)
