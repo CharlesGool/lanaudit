@@ -301,9 +301,59 @@ def transparent_proxy_warning(sample_ip: str, timeout=1.0) -> bool:
     return hits == len(probe_ports)
 
 
+def _arp_table_hosts():
+    """IPv4 addresses currently in this machine's ARP/neighbor cache, in any
+    state (including STALE) -- these got there because the device actually
+    answered an ARP request at some point, which is a real L2 presence
+    signal independent of whether it has any TCP port open at all."""
+    hosts = set()
+    try:
+        with open("/proc/net/arp") as f:
+            next(f, None)
+            for line in f:
+                parts = line.split()
+                if parts and parts[0].count(".") == 3:
+                    hosts.add(parts[0])
+    except OSError:
+        pass
+    return hosts
+
+
+def _ping_sweep(hosts, timeout=1.0, max_workers=256):
+    """Best-effort ICMP ping of each address, mainly to *provoke* an ARP
+    reply from devices that have gone quiet (and don't otherwise show up
+    in _arp_table_hosts()) -- most smart-home/IoT gear answers ARP/ICMP
+    even though it has no TCP service worth auditing. Silently returns an
+    empty set if the `ping` binary isn't usable (no privilege, sandboxed,
+    etc.) rather than failing the whole scan over a liveness nicety."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("ping"):
+        return set()
+
+    def _ping_one(ip):
+        try:
+            r = subprocess.run(
+                ["ping", "-c", "1", "-W", str(max(1, int(round(timeout)))), ip],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=timeout + 1,
+            )
+            return ip if r.returncode == 0 else None
+        except Exception:
+            return None
+
+    alive = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        for ip, ok in zip(hosts, ex.map(_ping_one, hosts)):
+            if ok:
+                alive.add(ip)
+    return alive
+
+
 def scan_subnet(subnet: str = None, ports=None, extra_ports=None, connect_timeout=0.35,
                  read_timeout=1.2, max_workers=200, progress_cb=None, lookup_names=True,
-                 target_ips=None):
+                 target_ips=None, include_portless=False):
     """Scan hosts for `ports`. Returns a list of HostResult for hosts that
     had at least one open port.
 
@@ -322,6 +372,14 @@ def scan_subnet(subnet: str = None, ports=None, extra_ports=None, connect_timeou
     COMMON_PORTS table (added, not replacing it) — the only way to find a
     service you've deliberately moved off its well-known port, since this
     scanner never sweeps the full 1-65535 range on its own.
+
+    `include_portless`: also report addresses that answered ARP/ICMP but
+    had no TCP port open at all (as a HostResult with an empty `ports`
+    list) -- most smart-home/IoT devices fall in this bucket, and without
+    this they'd simply be missing from the output with no indication they
+    were even looked at. Only applies when scanning a `subnet` (a CIDR);
+    ignored for an explicit `target_ips` list, since that's already a
+    known-live set from a previous pass.
     """
     service_map = {**COMMON_PORTS, **(extra_ports or {})}
     ports = ports or list(service_map)
@@ -351,6 +409,14 @@ def scan_subnet(subnet: str = None, ports=None, extra_ports=None, connect_timeou
 
     out = [HostResult(ip=ip, ports=sorted(infos, key=lambda i: i.port))
            for ip, infos in results.items()]
+
+    if include_portless and target_ips is None:
+        subnet_ips = set(hosts)
+        portless = ((_arp_table_hosts() | _ping_sweep(hosts, timeout=connect_timeout,
+                                                        max_workers=max_workers))
+                    & subnet_ips) - set(results)
+        out.extend(HostResult(ip=ip, ports=[]) for ip in portless)
+
     out.sort(key=lambda h: tuple(int(x) for x in h.ip.split(".")))
 
     if out and lookup_names:

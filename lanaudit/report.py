@@ -25,20 +25,25 @@ RISK_HINTS = {
 }
 
 
-def render_markdown(subnet, hosts, findings):
+def render_markdown(subnet, hosts, findings, proxy_suspected=False):
     lines = [f"# 局域网安全扫描报告", "", f"目标网段: `{subnet}`", ""]
     lines.append("## 发现的设备")
     lines.append("")
     if not hosts:
-        lines.append("(没有发现开放端口的主机)")
+        lines.append("(没有发现任何有响应的主机)")
     else:
+        suffix = ("**[未确认,可能是本机代理/VPN 造成的误判]**" if proxy_suspected
+                   else "**[未确认,协议未主动探测到,仅按端口号猜测]**")
         lines.append("| IP | 设备名 | 端口 | 服务 | 信息 |")
         lines.append("|---|---|---|---|---|")
         for h in hosts:
+            if not h.ports:
+                lines.append(f"| {h.ip} | {h.name} | - | - | 没有开放端口(ARP/ping 有响应) |")
+                continue
             for i, p in enumerate(h.ports):
                 label = p.http_title or p.http_server or p.banner or ""
                 if not p.confirmed:
-                    label = (label + " " if label else "") + "**[未确认,可能是本机代理/VPN 造成的误判]**"
+                    label = (label + " " if label else "") + suffix
                 lines.append(f"| {h.ip if i == 0 else ''} | {h.name if i == 0 else ''} | "
                              f"{p.port} | {p.guessed_service} | {label} |")
     lines.append("")

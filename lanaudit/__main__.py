@@ -70,6 +70,9 @@ def _scan_table(hosts, proxy_suspected=False):
     suffix = "[未确认,可能是代理误判]" if proxy_suspected else "[未确认,协议未主动探测到,仅按端口号猜测]"
     rows = []
     for h in hosts:
+        if not h.ports:
+            rows.append([h.ip, h.name, "-", "-", "没有开放端口(ARP/ping 有响应)"])
+            continue
         for i, p in enumerate(h.ports):
             label = p.http_title or p.http_server or p.banner
             if not p.confirmed:
@@ -135,6 +138,7 @@ def _preflight_check(args):
                 ans = ""
             if ans.strip().lower() != "yes":
                 raise SystemExit(1)
+    return proxy_suspected
 
 
 def _parse_extra_ports(args):
@@ -163,7 +167,8 @@ def _run_scan(args):
     (which must return an int exit code to the CLI, not this) and `cmd_audit`
     (which needs the hosts list to run credential checks against)."""
     print(BANNER, file=sys.stderr)
-    _preflight_check(args)
+    proxy_suspected = _preflight_check(args)
+    args._proxy_suspected = proxy_suspected  # stashed for cmd_audit's own markdown render
     extra_ports = _parse_extra_ports(args)
     t0 = time.time()
 
@@ -172,7 +177,8 @@ def _run_scan(args):
         hosts = discovery.scan_subnet(args.subnet, extra_ports=extra_ports,
                                        connect_timeout=args.connect_timeout,
                                        read_timeout=args.timeout, max_workers=args.workers,
-                                       progress_cb=_print_progress, lookup_names=not args.no_names)
+                                       progress_cb=_print_progress, lookup_names=not args.no_names,
+                                       include_portless=not args.no_portless)
     else:
         # Two phases: a cheap common-ports pass finds which addresses in the
         # subnet actually have something listening at all, then only THOSE
@@ -181,14 +187,23 @@ def _run_scan(args):
         # going to do efficiently, and skipping dead addresses is exactly
         # what a real attacker's recon would do too (no point port-sweeping
         # an address nothing answers on at all).
+        #
+        # include_portless=True here also pulls in addresses that answered
+        # ARP/ICMP but have no TCP port open (most smart-home/IoT gear) --
+        # those get reported too (with an empty port list), but filtered
+        # out of live_ips below so the expensive full sweep in phase 2
+        # never wastes 65535 ports per port-less device.
         print(f"[*] 第一阶段:用常见端口表快速摸一遍 {args.subnet},找出哪些地址在线...",
               file=sys.stderr)
         live_hosts = discovery.scan_subnet(args.subnet, extra_ports=extra_ports,
                                             connect_timeout=args.connect_timeout,
                                             read_timeout=args.timeout, max_workers=args.workers,
-                                            progress_cb=_print_progress, lookup_names=False)
-        live_ips = [h.ip for h in live_hosts]
-        print(f"\n[*] 第一阶段完成,用时 {time.time()-t0:.1f}s,{len(live_ips)} 台地址有响应",
+                                            progress_cb=_print_progress, lookup_names=False,
+                                            include_portless=not args.no_portless)
+        portless_hosts = [h for h in live_hosts if not h.ports]
+        live_ips = [h.ip for h in live_hosts if h.ports]
+        print(f"\n[*] 第一阶段完成,用时 {time.time()-t0:.1f}s,{len(live_ips)} 台地址有开放端口,"
+              f"另外 {len(portless_hosts)} 台有响应但没有开放端口",
               file=sys.stderr)
 
         n_tasks = len(live_ips) * 65535
@@ -218,16 +233,26 @@ def _run_scan(args):
                                            progress_cb=_print_progress, lookup_names=not args.no_names)
             print(f"\n[*] 第二阶段完成,用时 {time.time()-t1:.1f}s", file=sys.stderr)
 
-    print(f"\n[*] 完成,总用时 {time.time()-t0:.1f}s,发现 {len(hosts)} 台有开放端口的主机",
+        if portless_hosts:
+            if not args.no_names:
+                discovery._attach_names(portless_hosts, timeout=args.timeout,
+                                         max_workers=args.workers)
+            hosts = sorted(hosts + portless_hosts,
+                            key=lambda h: tuple(int(x) for x in h.ip.split(".")))
+
+    n_with_ports = sum(1 for h in hosts if h.ports)
+    n_portless = len(hosts) - n_with_ports
+    print(f"\n[*] 完成,总用时 {time.time()-t0:.1f}s,发现 {n_with_ports} 台有开放端口的主机"
+          + (f",{n_portless} 台有响应但没有开放端口" if n_portless else ""),
           file=sys.stderr)
     if hosts:
-        print("\n" + _scan_table(hosts))
+        print("\n" + _scan_table(hosts, proxy_suspected))
     if args.json:
         report.write_json(args.json, report.discovery_to_dict(hosts))
         print(f"\n[*] JSON 已保存到 {args.json}", file=sys.stderr)
     if args.markdown:
         with open(args.markdown, "w", encoding="utf-8") as fh:
-            fh.write(report.render_markdown(args.subnet, hosts, []))
+            fh.write(report.render_markdown(args.subnet, hosts, [], proxy_suspected))
         print(f"[*] Markdown 报告已保存到 {args.markdown}", file=sys.stderr)
     return hosts
 
@@ -374,7 +399,8 @@ def cmd_audit(args):
         report.write_json(args.json, {"hosts": data, "findings": findings})
     if args.markdown:
         with open(args.markdown, "w", encoding="utf-8") as fh:
-            fh.write(report.render_markdown(args.subnet, hosts, findings))
+            fh.write(report.render_markdown(args.subnet, hosts, findings,
+                                             getattr(args, "_proxy_suspected", False)))
         print(f"[*] Markdown 报告已保存到 {args.markdown}", file=sys.stderr)
     return 0
 
@@ -403,6 +429,10 @@ def build_parser():
                          help="跳过透明代理/VPN 的预检查警告,直接开始扫描")
     common.add_argument("--no-names", action="store_true",
                          help="不尝试反查设备名(反向 DNS / NetBIOS),扫描会快一点")
+    common.add_argument("--no-portless", action="store_true",
+                         help="只报告有开放端口的主机;默认还会用 ARP/ping 把局域网里"
+                              "答应了但没开任何端口的设备(常见于智能家居/IoT)也列出来,"
+                              "标注没有开放端口")
     common.add_argument("--full", action="store_true",
                          help="扫描全部 1-65535 端口,而不是内置的常见端口表。"
                               "真要'假设对方会用非标准端口躲你'这种思路,就不能只扫"
