@@ -4,7 +4,8 @@ from dataclasses import asdict
 
 
 def discovery_to_dict(hosts):
-    return [{"ip": h.ip, "name": h.name, "ports": [asdict(p) for p in h.ports]} for h in hosts]
+    return [{"ip": h.ip, "name": h.name, "mac": h.mac, "vendor": h.vendor,
+             "ports": [asdict(p) for p in h.ports]} for h in hosts]
 
 
 def write_json(path, data):
@@ -38,7 +39,12 @@ def render_markdown(subnet, hosts, findings, proxy_suspected=False):
         lines.append("|---|---|---|---|---|")
         for h in hosts:
             if not h.ports:
-                lines.append(f"| {h.ip} | {h.name} | - | - | 没有开放端口(ARP/ping 有响应) |")
+                info = "没有开放端口(ARP/ping 有响应)"
+                if h.mac:
+                    info += f" MAC {h.mac}"
+                    if h.vendor:
+                        info += f" ({h.vendor})"
+                lines.append(f"| {h.ip} | {h.name} | - | - | {info} |")
                 continue
             for i, p in enumerate(h.ports):
                 label = p.http_title or p.http_server or p.banner or ""

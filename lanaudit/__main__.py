@@ -71,7 +71,12 @@ def _scan_table(hosts, proxy_suspected=False):
     rows = []
     for h in hosts:
         if not h.ports:
-            rows.append([h.ip, h.name, "-", "-", "没有开放端口(ARP/ping 有响应)"])
+            info = "没有开放端口(ARP/ping 有响应)"
+            if h.mac:
+                info += f" MAC {h.mac}"
+                if h.vendor:
+                    info += f" ({h.vendor})"
+            rows.append([h.ip, h.name, "-", "-", info])
             continue
         for i, p in enumerate(h.ports):
             label = p.http_title or p.http_server or p.banner

@@ -53,6 +53,8 @@ class HostResult:
     ip: str
     ports: list = field(default_factory=list)
     name: str = ""
+    mac: str = ""
+    vendor: str = ""
 
 
 def _tcp_connect(ip, port, timeout):
@@ -302,31 +304,31 @@ def transparent_proxy_warning(sample_ip: str, timeout=1.0) -> bool:
 
 
 def _arp_table_hosts():
-    """IPv4 addresses with a *resolved* entry in this machine's ARP cache
-    (includes STALE, which is still a real past reply, just not refreshed
-    recently) -- these got there because the device actually answered an
-    ARP request at some point, independent of whether it has any TCP port
-    open. /proc/net/arp's Flags column's ATF_COM bit (0x2) is what
-    distinguishes an actual resolved entry from an incomplete one (flags
-    0x0, HW address 00:00:00:00:00:00) left behind by an ARP request that
-    nothing ever answered -- e.g. every dead address a previous port scan
-    tried to connect() to. Without this check, those unanswered entries
-    looked exactly like real devices.
+    """{ip: mac} for every address with a *resolved* entry in this machine's
+    ARP cache (includes STALE, which is still a real past reply, just not
+    refreshed recently) -- these got there because the device actually
+    answered an ARP request at some point, independent of whether it has
+    any TCP port open. /proc/net/arp's Flags column's ATF_COM bit (0x2) is
+    what distinguishes an actual resolved entry from an incomplete one
+    (flags 0x0, HW address 00:00:00:00:00:00) left behind by an ARP
+    request that nothing ever answered -- e.g. every dead address a
+    previous port scan tried to connect() to. Without this check, those
+    unanswered entries looked exactly like real devices.
     """
-    hosts = set()
+    hosts = {}
     try:
         with open("/proc/net/arp") as f:
             next(f, None)
             for line in f:
                 parts = line.split()
-                if len(parts) < 3 or parts[0].count(".") != 3:
+                if len(parts) < 4 or parts[0].count(".") != 3:
                     continue
                 try:
                     flags = int(parts[2], 16)
                 except ValueError:
                     continue
                 if flags & 0x2:  # ATF_COM -- actually resolved, not a pending/failed attempt
-                    hosts.add(parts[0])
+                    hosts[parts[0]] = parts[3]
     except OSError:
         pass
     return hosts
@@ -425,16 +427,58 @@ def scan_subnet(subnet: str = None, ports=None, extra_ports=None, connect_timeou
 
     if include_portless and target_ips is None:
         subnet_ips = set(hosts)
-        portless = ((_arp_table_hosts() | _ping_sweep(hosts, timeout=connect_timeout,
-                                                        max_workers=max_workers))
-                    & subnet_ips) - set(results)
-        out.extend(HostResult(ip=ip, ports=[]) for ip in portless)
+        _ping_sweep(hosts, timeout=connect_timeout, max_workers=max_workers)
+        # Re-read the ARP cache *after* pinging -- a successful ping just
+        # populated fresh entries for anything that was quiet before.
+        arp_map = _arp_table_hosts()
+        portless = (set(arp_map) & subnet_ips) - set(results)
+        out.extend(HostResult(ip=ip, ports=[], mac=arp_map.get(ip, "")) for ip in portless)
+        for h in out:
+            if not h.mac and h.ip in arp_map:
+                h.mac = arp_map[h.ip]
+        _attach_vendors(out, timeout=read_timeout)
 
     out.sort(key=lambda h: tuple(int(x) for x in h.ip.split(".")))
 
     if out and lookup_names:
         _attach_names(out, timeout=read_timeout, max_workers=max_workers)
     return out
+
+
+def _mac_vendor(mac, timeout=2.0):
+    """Best-effort OUI vendor lookup via the free macvendors.com API --
+    network-dependent and silently returns "" on any failure (offline,
+    rate-limited, unknown prefix), since this is a nice-to-have label, not
+    something the scan should ever block or fail on."""
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(f"https://api.macvendors.com/{mac}",
+                                      headers={"User-Agent": "lanaudit"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+
+def _attach_vendors(hosts, timeout):
+    """One vendor lookup per unique MAC (several hosts can share nothing,
+    but no point re-querying the same OUI twice in one run). Low
+    concurrency on purpose -- macvendors.com's free tier is rate-limited
+    per second, and a burst just means more empty results, not faster
+    ones."""
+    macs = sorted({h.mac for h in hosts if h.mac and not h.vendor})
+    if not macs:
+        return
+    vendor_by_mac = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {ex.submit(_mac_vendor, m, timeout): m for m in macs}
+        for fut in concurrent.futures.as_completed(futs):
+            vendor_by_mac[futs[fut]] = fut.result()
+    for h in hosts:
+        if h.mac in vendor_by_mac:
+            h.vendor = vendor_by_mac[h.mac]
 
 
 def _attach_names(hosts, timeout, max_workers):
