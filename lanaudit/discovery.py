@@ -302,17 +302,30 @@ def transparent_proxy_warning(sample_ip: str, timeout=1.0) -> bool:
 
 
 def _arp_table_hosts():
-    """IPv4 addresses currently in this machine's ARP/neighbor cache, in any
-    state (including STALE) -- these got there because the device actually
-    answered an ARP request at some point, which is a real L2 presence
-    signal independent of whether it has any TCP port open at all."""
+    """IPv4 addresses with a *resolved* entry in this machine's ARP cache
+    (includes STALE, which is still a real past reply, just not refreshed
+    recently) -- these got there because the device actually answered an
+    ARP request at some point, independent of whether it has any TCP port
+    open. /proc/net/arp's Flags column's ATF_COM bit (0x2) is what
+    distinguishes an actual resolved entry from an incomplete one (flags
+    0x0, HW address 00:00:00:00:00:00) left behind by an ARP request that
+    nothing ever answered -- e.g. every dead address a previous port scan
+    tried to connect() to. Without this check, those unanswered entries
+    looked exactly like real devices.
+    """
     hosts = set()
     try:
         with open("/proc/net/arp") as f:
             next(f, None)
             for line in f:
                 parts = line.split()
-                if parts and parts[0].count(".") == 3:
+                if len(parts) < 3 or parts[0].count(".") != 3:
+                    continue
+                try:
+                    flags = int(parts[2], 16)
+                except ValueError:
+                    continue
+                if flags & 0x2:  # ATF_COM -- actually resolved, not a pending/failed attempt
                     hosts.add(parts[0])
     except OSError:
         pass
