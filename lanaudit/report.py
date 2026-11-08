@@ -5,6 +5,7 @@ from dataclasses import asdict
 
 def discovery_to_dict(hosts):
     return [{"ip": h.ip, "name": h.name, "mac": h.mac, "vendor": h.vendor,
+             "possibly_banned": h.possibly_banned,
              "ports": [asdict(p) for p in h.ports]} for h in hosts]
 
 
@@ -39,7 +40,11 @@ def render_markdown(subnet, hosts, findings, proxy_suspected=False):
         lines.append("|---|---|---|---|---|")
         for h in hosts:
             if not h.ports:
-                info = "没有开放端口(ARP/ping 有响应)"
+                if getattr(h, "possibly_banned", False):
+                    info = ("**[!] 探测到的端口全部超时无响应,一个'连接拒绝'都没有——"
+                             "像是对方把这台机器的 IP 临时封了,不代表真没开端口]**")
+                else:
+                    info = "没有开放端口(ARP/ping 有响应)"
                 if h.mac:
                     info += f" MAC {h.mac}"
                     if h.vendor:

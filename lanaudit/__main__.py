@@ -71,7 +71,10 @@ def _scan_table(hosts, proxy_suspected=False):
     rows = []
     for h in hosts:
         if not h.ports:
-            info = "没有开放端口(ARP/ping 有响应)"
+            if h.possibly_banned:
+                info = "[!] 探测到的端口全部超时无响应,一个'连接拒绝'都没有——像是对方把这台机器的 IP 临时封了,不代表真没开端口"
+            else:
+                info = "没有开放端口(ARP/ping 有响应)"
             if h.mac:
                 info += f" MAC {h.mac}"
                 if h.vendor:
@@ -194,10 +197,16 @@ def _run_scan(args):
         # an address nothing answers on at all).
         #
         # include_portless=True here also pulls in addresses that answered
-        # ARP/ICMP but have no TCP port open (most smart-home/IoT gear) --
-        # those get reported too (with an empty port list), but filtered
-        # out of live_ips below so the expensive full sweep in phase 2
-        # never wastes 65535 ports per port-less device.
+        # ARP/ICMP but have no TCP port open from the *common*-port table --
+        # those still get the full 1-65535 sweep below (unless they look
+        # banned, see below), because --full exists specifically to catch
+        # a service deliberately moved off a well-known port, and a device
+        # with literally nothing on any common port is exactly the kind of
+        # host that matters most to full-sweep. Only an address that looks
+        # actively firewalled against this machine right now (see
+        # _looks_banned in discovery.py) is excluded -- sweeping 65535
+        # ports against a target currently blocking us would just be
+        # 65535 wasted timeouts, not real information.
         print(f"[*] 第一阶段:用常见端口表快速摸一遍 {args.subnet},找出哪些地址在线...",
               file=sys.stderr)
         live_hosts = discovery.scan_subnet(args.subnet, extra_ports=extra_ports,
@@ -205,11 +214,20 @@ def _run_scan(args):
                                             read_timeout=args.timeout, max_workers=args.workers,
                                             progress_cb=_print_progress, lookup_names=False,
                                             include_portless=not args.no_portless)
-        portless_hosts = [h for h in live_hosts if not h.ports]
-        live_ips = [h.ip for h in live_hosts if h.ports]
-        print(f"\n[*] 第一阶段完成,用时 {time.time()-t0:.1f}s,{len(live_ips)} 台地址有开放端口,"
-              f"另外 {len(portless_hosts)} 台有响应但没有开放端口",
+        banned_hosts = [h for h in live_hosts if not h.ports and h.possibly_banned]
+        portless_hosts = [h for h in live_hosts if not h.ports and not h.possibly_banned]
+        live_ips = [h.ip for h in live_hosts if h.ports] + [h.ip for h in portless_hosts]
+        print(f"\n[*] 第一阶段完成,用时 {time.time()-t0:.1f}s,"
+              f"{sum(1 for h in live_hosts if h.ports)} 台地址有开放端口,"
+              f"{len(portless_hosts)} 台有响应但没有开放端口(会继续做全端口扫描),"
+              + (f"{len(banned_hosts)} 台看起来是这台机器的 IP 被对方临时封禁了"
+                 "(跳过全端口扫描,等封禁过了再重试)" if banned_hosts else ""),
               file=sys.stderr)
+        for h in banned_hosts:
+            print(f"    [!] {h.ip}: 所有探测端口都是超时无响应、一个都没收到'连接拒绝'(RST),"
+                  "这是对方防火墙在悄悄丢你这个 IP 的包,不是真的没开端口。"
+                  "通常是之前的扫描/审计触发了它自己的 fail2ban/banip,等个几分钟再扫一次。",
+                  file=sys.stderr)
 
         n_tasks = len(live_ips) * 65535
         if n_tasks > 2_000_000 and not args.force:
@@ -238,11 +256,18 @@ def _run_scan(args):
                                            progress_cb=_print_progress, lookup_names=not args.no_names)
             print(f"\n[*] 第二阶段完成,用时 {time.time()-t1:.1f}s", file=sys.stderr)
 
-        if portless_hosts:
+        # portless_hosts went through the full 65535-port sweep above (they
+        # were folded into live_ips) -- any that still found nothing stay
+        # genuinely port-less and need to be re-added, since scan_subnet
+        # only returns entries that actually found an open port.
+        found_ips = {h.ip for h in hosts}
+        still_portless = [h for h in portless_hosts if h.ip not in found_ips]
+        extra = still_portless + banned_hosts
+        if extra:
             if not args.no_names:
-                discovery._attach_names(portless_hosts, timeout=args.timeout,
+                discovery._attach_names(extra, timeout=args.timeout,
                                          max_workers=args.workers)
-            hosts = sorted(hosts + portless_hosts,
+            hosts = sorted(hosts + extra,
                             key=lambda h: tuple(int(x) for x in h.ip.split(".")))
 
     n_with_ports = sum(1 for h in hosts if h.ports)

@@ -5,6 +5,7 @@ any time.
 from __future__ import annotations
 
 import concurrent.futures
+import errno
 import ipaddress
 import re
 import socket
@@ -55,6 +56,7 @@ class HostResult:
     name: str = ""
     mac: str = ""
     vendor: str = ""
+    possibly_banned: bool = False
 
 
 def _tcp_connect(ip, port, timeout):
@@ -334,6 +336,54 @@ def _arp_table_hosts():
     return hosts
 
 
+def _classify_connect(ip, port, timeout):
+    """Like _tcp_connect, but keeps the *reason* a connection didn't open
+    instead of collapsing it to None -- that distinction is exactly what
+    tells a genuinely-closed port apart from one a firewall is silently
+    dropping packets for (see _looks_banned)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        err = s.connect_ex((ip, port))
+    except socket.timeout:
+        s.close()
+        return "timeout"
+    except OSError:
+        s.close()
+        return "error"
+    if err == 0:
+        s.close()
+        return "open"
+    s.close()
+    # ECONNREFUSED (Linux 111, same errno constant cross-platform via the
+    # errno module) means the kernel on the other end actually answered
+    # with a TCP RST -- a real "nothing is listening here" answer. Any
+    # other non-zero errno from a *timed-out* settimeout() socket would
+    # have raised socket.timeout above instead of landing here, so by
+    # elimination everything else here is also a real (if unusual) refusal.
+    return "refused" if err == errno.ECONNREFUSED else "error"
+
+
+def _looks_banned(ip, ports, timeout, max_workers=32, sample_size=12):
+    """Best-effort guess at whether *this machine specifically* is
+    currently being firewalled by the target (e.g. its own fail2ban/banip
+    reacting to an earlier, unrelated scan/audit against it) rather than
+    the target genuinely having nothing listening. The tell: a real closed
+    port answers with an immediate TCP RST (classified "refused" above);
+    a firewall rule silently dropping this source's packets just times
+    out, with no RST at all. If every single port we tried timed out and
+    not one came back refused, that's the ban/drop signature, not "a
+    quiet device" -- a quiet device still has *some* closed ports that
+    answer normally.
+    """
+    sample = ports[:sample_size] if len(ports) > sample_size else ports
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        results = list(ex.map(lambda p: _classify_connect(ip, p, timeout), sample))
+    return ("open" not in results and "refused" not in results
+            and results.count("timeout") >= 3)
+
+
 def _ping_sweep(hosts, timeout=1.0, max_workers=256):
     """Best-effort ICMP ping of each address, mainly to *provoke* an ARP
     reply from devices that have gone quiet (and don't otherwise show up
@@ -432,7 +482,9 @@ def scan_subnet(subnet: str = None, ports=None, extra_ports=None, connect_timeou
         # populated fresh entries for anything that was quiet before.
         arp_map = _arp_table_hosts()
         portless = (set(arp_map) & subnet_ips) - set(results)
-        out.extend(HostResult(ip=ip, ports=[], mac=arp_map.get(ip, "")) for ip in portless)
+        out.extend(HostResult(ip=ip, ports=[], mac=arp_map.get(ip, ""),
+                               possibly_banned=_looks_banned(ip, ports, connect_timeout))
+                   for ip in portless)
         for h in out:
             if not h.mac and h.ip in arp_map:
                 h.mac = arp_map[h.ip]
