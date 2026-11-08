@@ -59,15 +59,8 @@ def _findings_table(findings):
     return _table([h for h, _ in cols], rows)
 
 
-def _scan_table(hosts, proxy_suspected=False):
+def _scan_table(hosts):
     headers = ["IP", "设备名", "端口", "服务", "信息"]
-    # The "proxy misjudgment" caveat is only accurate when the preflight
-    # transparent_proxy_warning() check actually fired for this run -- most
-    # "未确认" ports are just protocols that never send an unsolicited
-    # banner and don't answer HTTP (SMB/RPC/RDP-handshakeless/VMConnect/
-    # WS-Discovery etc.); labeling every one of those as a possible proxy
-    # artifact when no proxy was ever detected was misleading.
-    suffix = "[未确认,可能是代理误判]" if proxy_suspected else "[未确认,协议未主动探测到,仅按端口号猜测]"
     rows = []
     for h in hosts:
         if not h.ports:
@@ -82,9 +75,7 @@ def _scan_table(hosts, proxy_suspected=False):
             rows.append([h.ip, h.name, "-", "-", info])
             continue
         for i, p in enumerate(h.ports):
-            label = p.http_title or p.http_server or p.banner
-            if not p.confirmed:
-                label = (label + " " if label else "") + suffix
+            label = (p.http_title or p.http_server or p.banner) if p.confirmed else "-"
             rows.append([h.ip if i == 0 else "", h.name if i == 0 else "",
                          str(p.port), p.guessed_service, label[:80]])
     return _table(headers, rows)
@@ -276,7 +267,7 @@ def _run_scan(args):
           + (f",{n_portless} 台有响应但没有开放端口" if n_portless else ""),
           file=sys.stderr)
     if hosts:
-        print("\n" + _scan_table(hosts, proxy_suspected))
+        print("\n" + _scan_table(hosts))
     if args.json:
         report.write_json(args.json, report.discovery_to_dict(hosts))
         print(f"\n[*] JSON 已保存到 {args.json}", file=sys.stderr)
