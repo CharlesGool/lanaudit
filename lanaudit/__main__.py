@@ -27,7 +27,7 @@ for _stream in (sys.stdout, sys.stderr):
         pass
 
 from . import discovery, report
-from .checkers import REGISTRY
+from .checkers import PRECHECKS, REGISTRY
 from .wordlists import DEFAULT_PASSWORDS, DEFAULT_USERNAMES, load_list
 
 BANNER = """\
@@ -270,6 +270,13 @@ def cmd_audit(args):
 
     def audit_one_target(h, p, checker):
         findings_here, lockout_here = [], None
+        precheck = PRECHECKS.get(p.guessed_service)
+        if precheck is not None and not precheck(h.ip, p.port, args.timeout):
+            # E.g. an HTTP(S) page that was never gated by Basic auth at
+            # all -- running the whole password list against it one request
+            # at a time would just re-learn "not applicable" every single
+            # time, for nothing.
+            return findings_here, lockout_here, True
         found = threading.Event()
         cap_hit = threading.Event()
         fail_count = [0]
@@ -309,17 +316,23 @@ def cmd_audit(args):
         if suspect:
             suspect.update(ip=h.ip, port=p.port, service=p.guessed_service)
             lockout_here = suspect
-        return findings_here, lockout_here
+        return findings_here, lockout_here, False
 
     findings = []
     lockout_suspects = []
+    skipped_count = 0
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.target_workers)) as ex:
         futs = [ex.submit(audit_one_target, h, p, checker) for h, p, checker in targets]
         for fut in concurrent.futures.as_completed(futs):
-            findings_here, lockout_here = fut.result()
+            findings_here, lockout_here, skipped = fut.result()
             findings.extend(findings_here)
             if lockout_here:
                 lockout_suspects.append(lockout_here)
+            if skipped:
+                skipped_count += 1
+    if skipped_count:
+        print(f"[*] 其中 {skipped_count} 个目标一看就不需要测密码(比如网页压根没启用 "
+              f"Basic 认证),直接跳过了,没有浪费密码表去反复确认这件事", file=sys.stderr)
 
     print(f"\n[*] 完成,共 {len(findings)} 处弱密码/无密码可登录。", file=sys.stderr)
     if findings:
