@@ -24,6 +24,8 @@ COMMON_PORTS = {
     8080: "http", 8081: "http", 8082: "http", 8083: "http", 8443: "https",
     8888: "http", 8899: "http", 9000: "http", 9090: "http", 9100: "jetdirect",
     10001: "http", 20000: "http", 32400: "http", 37777: "dvr", 49152: "upnp",
+    111: "rpcbind", 135: "msrpc", 2179: "vmconnect", 3702: "ws-discovery",
+    5357: "wsdapi", 5985: "winrm", 5986: "winrm-https", 7680: "wu-do",
 }
 
 HTTP_PORTS = {80, 81, 88, 808, 1400, 3000, 5000, 5555, 7000, 7001, 7788,
@@ -240,6 +242,7 @@ def _scan_port(ip, port, connect_timeout, read_timeout, service_map):
             title, server, auth = _parse_http(raw)
             info.http_title, info.http_server, info.http_auth = title, server, auth
             info.guessed_service = "https" if port in HTTPS_PORTS else "http"
+            got_evidence = True  # a real HTTP response even without a <title>/Server header
     elif info.guessed_service in ACTIVE_PROBES and not info.banner:
         # Services that stay silent until spoken to: a bare connect() success
         # tells us nothing (and is exactly what a transparent proxy fakes), so
@@ -250,6 +253,23 @@ def _scan_port(ip, port, connect_timeout, read_timeout, service_map):
         resp = ACTIVE_PROBES[info.guessed_service](ip, port, read_timeout)
         if resp:
             info.banner = f"{info.guessed_service.upper()} 握手确认"
+            got_evidence = True
+    elif not info.banner:
+        # Connected, but neither the port number nor a passive banner told us
+        # anything. A huge share of "random" open ports on modern machines
+        # (dev servers, container dashboards, self-hosted UIs) are plain
+        # HTTP/HTTPS regardless of port number, so try that as a generic
+        # fallback before giving up and calling it "unknown" -- try HTTP
+        # first (cheaper, no TLS handshake), then HTTPS.
+        raw = _http_probe(ip, port, use_tls=False, timeout=read_timeout)
+        used_tls = False
+        if not raw:
+            raw = _http_probe(ip, port, use_tls=True, timeout=read_timeout)
+            used_tls = True
+        if raw:
+            title, server, auth = _parse_http(raw)
+            info.http_title, info.http_server, info.http_auth = title, server, auth
+            info.guessed_service = "https" if used_tls else "http"
             got_evidence = True
 
     info.confirmed = bool(got_evidence or info.http_title or info.http_server or info.http_auth)

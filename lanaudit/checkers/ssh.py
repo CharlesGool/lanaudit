@@ -21,15 +21,26 @@ def check(ip, port, username, password, timeout):
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     try:
-        client.connect(
-            ip, port=port, username=username, password=password,
-            timeout=timeout, auth_timeout=timeout, banner_timeout=timeout,
-            allow_agent=False, look_for_keys=False,
-        )
-        client.close()
-        return True
-    except paramiko.AuthenticationException:
-        return False
-    except Exception:
-        # Connection refused, protocol mismatch, etc. — not a credential result.
-        return None
+        try:
+            client.connect(
+                ip, port=port, username=username, password=password,
+                timeout=timeout, auth_timeout=timeout, banner_timeout=timeout,
+                allow_agent=False, look_for_keys=False,
+            )
+            return True
+        except paramiko.AuthenticationException:
+            return False
+        except Exception:
+            # Connection refused, protocol mismatch, etc. — not a credential result.
+            return None
+    finally:
+        # Every rejected/failed attempt used to skip this (close() was only
+        # on the success path), leaking the Transport thread + socket for
+        # every single wrong guess -- thousands of them across a real audit
+        # run. Left enough of those running concurrently at process exit to
+        # cause native-level corruption (observed as a glibc "double free or
+        # corruption (fasttop)" abort right after a real run finished).
+        try:
+            client.close()
+        except Exception:
+            pass

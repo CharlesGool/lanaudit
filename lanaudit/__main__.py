@@ -237,8 +237,21 @@ def _confirm_scope(args, usernames, passwords):
 
 
 def cmd_audit(args):
-    usernames = load_list(args.usernames_extra, args.username_file) or list(DEFAULT_USERNAMES)
-    passwords = load_list(args.passwords_extra, args.password_file) or list(DEFAULT_PASSWORDS)
+    # --password/--password-file ADD to the default list, they don't replace
+    # it -- `--password` was silently skipping the ~10k built-in list
+    # entirely (load_list(...) or DEFAULT_PASSWORDS never falls through once
+    # you've supplied anything), so "试试这个 + 默认弱密码表" was actually
+    # only ever testing "这个". Put the user's own guesses first since
+    # they're the most likely hit, then the generic list; --no-defaults
+    # opts back out for anyone who really does want an exact, narrow list.
+    extra_users = load_list(args.usernames_extra, args.username_file)
+    extra_pw = load_list(args.passwords_extra, args.password_file)
+    if args.no_defaults:
+        usernames = extra_users or list(DEFAULT_USERNAMES)
+        passwords = extra_pw or list(DEFAULT_PASSWORDS)
+    else:
+        usernames = list(dict.fromkeys(extra_users + DEFAULT_USERNAMES))
+        passwords = list(dict.fromkeys(extra_pw + DEFAULT_PASSWORDS))
 
     if not _confirm_scope(args, usernames, passwords):
         print("已取消。", file=sys.stderr)
@@ -373,6 +386,9 @@ def build_parser():
                     help="额外尝试的密码,可重复传入(你怀疑泄露的密码放这里)")
     a.add_argument("--username-file", help="每行一个用户名的文件")
     a.add_argument("--password-file", help="每行一个密码的文件")
+    a.add_argument("--no-defaults", action="store_true",
+                    help="--username/--password 只用你给的,不自动加上内置的默认用户名/"
+                         "弱密码表(默认是两边一起试)")
     a.add_argument("--max-fail", type=int, default=0,
                     help="同一台设备累计失败多少次后跳过。默认 0 = 不设上限,"
                          "密码表会试完;担心把有登录锁定机制的设备越试越锁,"
